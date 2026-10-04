@@ -4,9 +4,9 @@ const c = u.c;
 const ui = @import("ui.zig");
 const alpm = @import("alpm.zig");
 const signals = @import("signals.zig");
-pub const Operation = enum { install, remove, upgrade };
-pub const Target = struct { name: []const u8, archive: ?[]const u8 = null, sha256: ?[]const u8 = null, dependency: bool = false };
-pub const Request = struct { operation: Operation, targets: []const Target = &.{}, recursive: bool = false, nosave: bool = false };
+pub const Operation = enum { install, remove, upgrade, reason };
+pub const Target = struct { name: []const u8, archive: ?[]const u8 = null, sha256: ?[]const u8 = null, dependency: bool = false, reason: ?@import("cli.zig").Reason = null };
+pub const Request = struct { operation: Operation, targets: []const Target = &.{}, recursive: bool = false, nosave: bool = false, needed: bool = false };
 pub fn escalate(request: Request) !void {
     try validate(request);
     try trustedExecutable();
@@ -28,12 +28,15 @@ pub fn trustedExecutable() !void {
 }
 pub fn validate(request: Request) !void {
     if (request.operation != .remove and (request.recursive or request.nosave)) return error.InvalidTransactionFlags;
+    if (request.needed and request.operation != .install) return error.InvalidTransactionFlags;
     if (request.targets.len > 1024) return error.TransactionTooLarge;
     for (request.targets, 0..) |target, i| {
+        if (target.reason != null and request.operation != .install and request.operation != .reason) return error.InvalidTransactionFlags;
+        if (request.operation == .reason and target.reason == null) return error.InstallationReasonRequired;
         if (!u.validName(target.name)) return error.InvalidPackageName;
         for (request.targets[0..i]) |previous| if (std.mem.eql(u8, target.name, previous.name)) return error.DuplicateTarget;
         if (target.archive) |path| {
-            if (request.operation != .install or !std.fs.path.isAbsolute(path) or !std.mem.startsWith(u8, std.fs.path.basename(path), target.name)) return error.InvalidArchive;
+            if (request.operation != .install or !std.fs.path.isAbsolute(path)) return error.InvalidArchive;
             const hash = target.sha256 orelse return error.MissingDigest;
             if (hash.len != 64) return error.InvalidDigest;
             for (hash) |ch| if (!std.ascii.isHex(ch)) return error.InvalidDigest;
@@ -106,8 +109,20 @@ pub fn worker(bytes: []const u8) !void {
     if (request.operation == .upgrade) try db.refresh();
     try signals.check();
     // Acquire the normal ALPM lock. Never delete another process's lock.
-    try db.check(c.alpm_trans_init(db.h, c.ALPM_TRANS_FLAG_NEEDED | (if (request.operation == .remove and request.recursive) @as(c_int, c.ALPM_TRANS_FLAG_RECURSE) else @as(c_int, 0)) | (if (request.nosave) @as(c_int, c.ALPM_TRANS_FLAG_NOSAVE) else @as(c_int, 0))));
+    try db.check(c.alpm_trans_init(db.h, flags(request)));
     defer _ = c.alpm_trans_release(db.h);
+    if (request.operation == .reason) {
+        ui.title("Installation reasons");
+        for (request.targets) |target| {
+            if (c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(target.name)).ptr) == null) return error.PackageNotInstalled;
+            ui.print("  Mark {s} as {s}\n", .{ ui.safe(target.name), @tagName(target.reason.?) });
+        }
+        try ui.require("Apply these installation reason changes? [y/N] ");
+        try signals.check();
+        for (request.targets) |target| try db.check(c.alpm_pkg_set_reason(c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(target.name)).ptr), installReason(target, false)));
+        ui.print("Installation reasons updated.\n", .{});
+        return;
+    }
     if (request.operation == .upgrade) try db.check(c.alpm_sync_sysupgrade(db.h, 0));
     var old_explicit: std.StringHashMap(void) = .init(u.a);
     var local_it = db.installed();
@@ -143,27 +158,27 @@ pub fn worker(bytes: []const u8) !void {
     try signals.check();
     const additions = c.alpm_trans_get_add(db.h);
     const removals = c.alpm_trans_get_remove(db.h);
-    var promotions: std.ArrayList([]const u8) = .empty;
-    if (request.operation != .remove) for (request.targets) |target| {
-        if (!target.dependency) if (c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(target.name)).ptr)) |p| {
-            if (c.alpm_pkg_get_reason(p) == c.ALPM_PKG_REASON_DEPEND) try promotions.append(u.a, target.name);
-        };
+    var reason_changes: std.ArrayList(Target) = .empty;
+    if (request.operation == .install) for (request.targets) |target| {
+        if (c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(target.name)).ptr)) |p| {
+            if (c.alpm_pkg_get_reason(p) != installReason(target, old_explicit.contains(target.name))) try reason_changes.append(u.a, target);
+        }
     };
     if (additions == null and removals == null) {
-        if (promotions.items.len == 0) {
+        if (reason_changes.items.len == 0) {
             ui.print("Everything is up to date.\n", .{});
             return;
         }
         ui.title("Installation reasons");
-        for (promotions.items) |n| ui.print("  Mark {s} as explicitly installed\n", .{ui.safe(n)});
+        for (reason_changes.items) |target| showReason(target, old_explicit.contains(target.name));
         try ui.require("Apply these installation reason changes? [y/N] ");
         try signals.check();
-        for (promotions.items) |n| try db.check(c.alpm_pkg_set_reason(c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(n)).ptr), c.ALPM_PKG_REASON_EXPLICIT));
+        for (reason_changes.items) |target| try db.check(c.alpm_pkg_set_reason(c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(target.name)).ptr), installReason(target, old_explicit.contains(target.name))));
         ui.print("Installation reasons updated.\n", .{});
         return;
     }
     ui.title("System transaction");
-    for (promotions.items) |n| ui.print("  Mark {s} as explicitly installed\n", .{ui.safe(n)});
+    for (reason_changes.items) |target| showReason(target, old_explicit.contains(target.name));
     var size: i64 = 0;
     var it = additions;
     while (it != null) : (it = it.*.next) {
@@ -193,11 +208,29 @@ pub fn worker(bytes: []const u8) !void {
     }
     if (request.operation != .remove) for (request.targets) |target| {
         if (c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(target.name)).ptr)) |p| {
-            const reason: c.alpm_pkgreason_t = if (!target.dependency or old_explicit.contains(target.name)) c.ALPM_PKG_REASON_EXPLICIT else c.ALPM_PKG_REASON_DEPEND;
+            const reason = installReason(target, old_explicit.contains(target.name));
             try db.check(c.alpm_pkg_set_reason(p, reason));
         }
     };
     ui.print("\nTransaction complete.\n", .{});
+}
+pub fn flags(request: Request) c_int {
+    return (if (request.needed) @as(c_int, c.ALPM_TRANS_FLAG_NEEDED) else @as(c_int, 0)) | (if (request.operation == .remove and request.recursive) @as(c_int, c.ALPM_TRANS_FLAG_RECURSE) else @as(c_int, 0)) | (if (request.nosave) @as(c_int, c.ALPM_TRANS_FLAG_NOSAVE) else @as(c_int, 0));
+}
+pub fn installReason(target: Target, old_explicit: bool) c.alpm_pkgreason_t {
+    if (target.reason) |reason| return if (reason == .explicit) c.ALPM_PKG_REASON_EXPLICIT else c.ALPM_PKG_REASON_DEPEND;
+    return if (!target.dependency or old_explicit) c.ALPM_PKG_REASON_EXPLICIT else c.ALPM_PKG_REASON_DEPEND;
+}
+fn showReason(target: Target, old_explicit: bool) void {
+    ui.print("  Mark {s} as {s}\n", .{ ui.safe(target.name), if (installReason(target, old_explicit) == c.ALPM_PKG_REASON_EXPLICIT) "explicit" else "dependency" });
+}
+test "reason overrides are explicit and worker flags cannot weaken unrelated operations" {
+    try std.testing.expectEqual(@as(c.alpm_pkgreason_t, c.ALPM_PKG_REASON_DEPEND), installReason(.{ .name = "foo", .reason = .dependency }, true));
+    try std.testing.expectEqual(@as(c.alpm_pkgreason_t, c.ALPM_PKG_REASON_EXPLICIT), installReason(.{ .name = "foo", .dependency = true }, true));
+    try std.testing.expectError(error.InvalidTransactionFlags, validate(.{ .operation = .remove, .needed = true, .targets = &.{.{ .name = "foo" }} }));
+    try std.testing.expectError(error.InstallationReasonRequired, validate(.{ .operation = .reason, .targets = &.{.{ .name = "foo" }} }));
+    try std.testing.expectError(error.InvalidTransactionFlags, validate(.{ .operation = .upgrade, .targets = &.{.{ .name = "foo", .reason = .dependency }} }));
+    try validate(.{ .operation = .reason, .targets = &.{.{ .name = "foo", .reason = .dependency }} });
 }
 test "worker rejects unsafe manifests" {
     try std.testing.expectError(error.InvalidPackageName, validate(.{ .operation = .install, .targets = &.{.{ .name = "../bad" }} }));

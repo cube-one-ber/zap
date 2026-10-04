@@ -50,21 +50,55 @@ List dependency packages without required or optional users.
 .B autoremove
 Review and remove orphan dependencies.
 .TP
-.B clean
-Confirm and clear the user's AUR source/build cache.
+.B clean [BASES] (-Sc)
+Confirm and clear all or selected package-base directories in the user's AUR source/build cache.
 .TP
 .B version (--version)
 Display the version and libalpm ABI.
+.TP
+.B select TERM
+Search and choose numbered packages or ranges for reviewed installation.
+.TP
+.B local-search TERM (-Qs), localinfo PACKAGES (-Qi)
+Search installed packages or display installed metadata and reverse dependencies.
+.TP
+.B build-local DIRS (-B), install-local DIRS (-Bi)
+Copy local PKGBUILDs and static .SRCINFO into fresh cache snapshots, resolve
+and review dependencies, then build or build and install. Copy every regular
+source file except Git metadata, top-level src/pkg trees and package archives.
+Reject symlinks and special files. Preserve the original checkout.
+.TP
+.B install-files FILES (-U)
+Inspect and hash local archives. The worker snapshots them and enforces local
+signature policy before installation. No code executes during inspection.
+.TP
+.B pkgbuild PACKAGES (-Gp), get PACKAGES (-G)
+Print PKGBUILDs or fetch AUR sources without executing them.
+.TP
+.B files PACKAGES (-Ql), owns FILES (-Qo)
+List installed file paths or find their installed owners.
+.TP
+.B check [PACKAGES] (-Qk)
+Check installed file presence. Return failure if files are missing.
+This is not content/checksum verification.
+.TP
+.B reason PACKAGES --asdeps|--asexplicit (-D)
+Confirm and change installation reasons under the ALPM lock.
+.TP
+.B stats (-Ps), news (-Pw)
+Show installed counts, sizes and largest packages, or recent Arch news links.
+Read intervention instructions before upgrading.
 .SH OPTIONS
 .TP
 .B --dry-run
 Skip builds, escalation and system changes. Install/build plans can fetch
 sources and ask for a provider. Final repository changes are resolved by
-libalpm during the actual transaction. get always fetches sources.
+libalpm during the actual transaction. get and pkgbuild fetch sources and reject this option.
 .TP
 .B --devel
 Include installed -git, -svn, -hg and -bzr packages for rebuild during updates
-or upgrade.
+or upgrade. Also includes -cvs, -darcs and -fossil. This requests rebuilds
+rather than tracking upstream commits.
 .TP
 .B --recursive
 Also remove unneeded dependencies with remove.
@@ -72,12 +106,59 @@ Also remove unneeded dependencies with remove.
 .B --nosave
 Discard backup configuration during remove. -Rns combines --recursive and
 --nosave.
+.TP
+.B --aur, --repo
+Limit search, select, info, install, updates and upgrade to the requested
+source. Dependencies can come from either source. -Sua and -Qua select
+AUR-only upgrade and updates. AUR-only upgrades do not refresh repositories;
+repository upgrades always perform a full repository upgrade.
+.TP
+.B --needed
+Skip current or newer installed targets during install, while applying
+requested reason changes. Without this flag, reinstall requested packages
+including same-version AUR rebuilds.
+.TP
+.B --asdeps, --asexplicit
+Override installation reasons for requested packages, not their dependencies.
+Also required with reason. Contradictory flags fail.
+.TP
+.B --sandbox, --no-sandbox
+Isolate all makepkg phases by default using bubblewrap. System and package
+database mounts are read-only. Only the checkout is writable on the host,
+with Git metadata read-only. Give each phase an empty environment and private
+home without credentials, agents or desktop sockets. Network access remains
+available for downloads. Probe before installation; failure never falls back.
+User makepkg configuration and signing keys are unavailable in the sandbox.
+--no-sandbox explicitly runs approved code with the invoking user's permissions.
+.TP
+.B --rebuildtree
+Rebuild installed foreign dependencies during builds, installs and upgrades.
+Reject combination with --needed; dependency cycles fail explicitly.
+.TP
+.B --cleanafter
+Remove untracked and ignored files after successful installation, retaining
+tracked review sources. Only valid for commands that can install builds.
+.TP
+.B --quiet, -q
+Print names only for search, local-search, updates, list, foreign, orphans,
+and owns. files prints paths only. -Qq, -Qmq and -Qdtq are aliases.
+.TP
+.B --searchby FIELD
+AUR search field: name, name-desc, maintainer, provides, depends,
+makedepends, checkdepends or optdepends. Repository search remains unchanged.
+.TP
+.B --sortby FIELD
+AUR search order: votes (default), popularity, name or modified.
+.TP
+.B --
+End option parsing; remaining arguments are targets, including filenames.
 .SH DATES
 All dates are UTC. AUR results show last modification. Repository results
 show build dates. Local listings show installation dates.
 .SH SECURITY
-PKGBUILDs execute arbitrary code as your user after review. Review does not
-sandbox that code. Every system transaction requires a separate final
+PKGBUILDs execute arbitrary code after review. Default sandboxing limits host
+access; --no-sandbox grants code the invoking user's permissions. The sandbox
+uses the host toolchain and is not a clean chroot or network isolation. Every system transaction requires a separate final
 confirmation and uses configured signature policies, ALPM locks and hooks.
 Approved archives are copied into private root-owned staging and checked
 against their SHA-256 digests before installation. AUR upgrades span several

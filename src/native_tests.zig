@@ -1,7 +1,7 @@
 const std = @import("std");
 const u = @import("util.zig");
 const c = u.c;
-fn fixture(dir: std.fs.Dir, root: []const u8, name: []const u8, extra: []const u8) ![]const u8 {
+pub fn fixture(dir: std.fs.Dir, root: []const u8, name: []const u8, extra: []const u8) ![]const u8 {
     try dir.writeFile(.{ .sub_path = ".PKGINFO", .data = try std.fmt.allocPrint(u.a, "pkgname = {s}\npkgver = 1.0-1\npkgdesc = isolated transaction fixture\nurl = https://example.org\nbuilddate = 1750000000\npackager = zap tests\nsize = 1\narch = any\n{s}", .{ name, extra }) });
     const path = try std.fmt.allocPrint(u.a, "{s}/{s}-1.0-1-any.pkg.tar", .{ root, name });
     try u.run(&.{ "/usr/bin/bsdtar", "-cf", path, "-C", root, ".PKGINFO" }, null);
@@ -76,4 +76,30 @@ test "native ALPM refuses conflicting packages" {
     var it = data;
     while (it != null) : (it = it.*.next) c.alpm_conflict_free(@ptrCast(@alignCast(it.*.data.?)));
     c.alpm_list_free(data);
+}
+
+// A local database fixture; writing these files never changes the host database.
+pub fn installedFixture(dir: std.fs.Dir, name: []const u8, files: []const u8) !void {
+    const path = try std.fmt.allocPrint(u.a, "db/local/{s}-1.0-1", .{name});
+    try dir.makePath(path);
+    try dir.writeFile(.{ .sub_path = "db/local/ALPM_DB_VERSION", .data = "9\n" });
+    try dir.writeFile(.{ .sub_path = try std.fs.path.join(u.a, &.{ path, "desc" }), .data = try std.fmt.allocPrint(u.a, "%NAME%\n{s}\n\n%VERSION%\n1.0-1\n\n%DESC%\nInstalled fixture\n\n%ARCH%\nany\n\n%SIZE%\n1\n\n%REASON%\n1\n\n", .{name}) });
+    try dir.writeFile(.{ .sub_path = try std.fs.path.join(u.a, &.{ path, "files" }), .data = try std.fmt.allocPrint(u.a, "%FILES%\n{s}\n\n", .{files}) });
+}
+test "same-version archives reinstall unless needed is requested" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(u.a, ".");
+    try installedFixture(tmp.dir, "zap-reinstall-fixture", "");
+    const archive = try fixture(tmp.dir, root, "zap-reinstall-fixture", "");
+    const h = try handle(root);
+    defer _ = c.alpm_release(h);
+    inline for (.{ false, true }) |needed| {
+        try std.testing.expectEqual(@as(c_int, 0), c.alpm_trans_init(h, @import("transaction.zig").flags(.{ .operation = .install, .needed = needed })));
+        try add(h, archive);
+        var data: [*c]c.alpm_list_t = null;
+        try std.testing.expectEqual(@as(c_int, 0), c.alpm_trans_prepare(h, &data));
+        try std.testing.expectEqual(@as(usize, if (needed) 0 else 1), c.alpm_list_count(c.alpm_trans_get_add(h)));
+        try std.testing.expectEqual(@as(c_int, 0), c.alpm_trans_release(h));
+    }
 }

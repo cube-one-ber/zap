@@ -6,7 +6,7 @@ pkgdesc='Native Zig AUR helper using libalpm and systemd run0'
 arch=('x86_64' 'aarch64')
 url='https://github.com/cube-one-ber/zap'
 license=('GPL-3.0-or-later')
-depends=('pacman>=7.0' 'libalpm.so' 'curl' 'git' 'systemd>=256' 'base-devel')
+depends=('pacman>=7.0' 'libalpm.so' 'curl' 'git' 'bubblewrap' 'systemd>=256' 'base-devel')
 optdepends=('polkit: authentication for systemd run0')
 makedepends=('pkgconf')
 # ZIG allows a verified external Zig 0.15.2 toolchain on rolling distributions.
