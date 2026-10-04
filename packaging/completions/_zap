@@ -1,0 +1,10 @@
+#compdef zap
+_arguments -s \
+  '--dry-run[Plan without builds or system changes]' \
+  '--devel[Include VCS rebuilds during updates or upgrade]' \
+  '--recursive[Remove unneeded dependencies]' \
+  '--nosave[Discard backup configuration during removal]' \
+  '--help[Show help]' \
+  '--version[Show version]' \
+  '1:command:(search info install build get upgrade updates list foreign remove orphans autoremove clean help version)' \
+  '*:package or search term:'

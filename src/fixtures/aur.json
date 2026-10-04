@@ -1,0 +1,1 @@
+{"version":5,"type":"multiinfo","resultcount":1,"results":[{"Name":"sample-cli","PackageBase":"sample-base","Version":"2.0-1","Description":"Fixture","Maintainer":"tester","LastModified":1750000000,"Depends":["libfoo>=2"],"Provides":["sample"],"UnknownFutureField":true}]}

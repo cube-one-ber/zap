@@ -1,0 +1,43 @@
+# Generate packaging/PKGBUILD and its local source archive with source.sh.
+pkgname=zap
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Native Zig AUR helper using libalpm and systemd run0'
+arch=('x86_64' 'aarch64')
+url='https://github.com/cube-one-ber/zap'
+license=('GPL-3.0-or-later')
+depends=('pacman>=7.0' 'libalpm.so' 'curl' 'git' 'systemd>=256' 'base-devel')
+optdepends=('polkit: authentication for systemd run0')
+makedepends=('pkgconf')
+# ZIG allows a verified external Zig 0.15.2 toolchain on rolling distributions.
+if [[ -z ${ZIG:-} ]]; then
+  makedepends+=('zig')
+fi
+source=('zap-source.tar.gz')
+sha256sums=('@SOURCE_SHA256@')
+
+build() {
+  cd "$srcdir/zap"
+  local compiler=${ZIG:-zig}
+  if [[ $("$compiler" version) != 0.15.2 ]]; then
+    error 'zap requires Zig 0.15.2; set ZIG to that compiler executable'
+    return 1
+  fi
+  "$compiler" build -Doptimize=ReleaseSafe
+}
+
+check() {
+  cd "$srcdir/zap"
+  "${ZIG:-zig}" build test
+}
+
+package() {
+  cd "$srcdir/zap"
+  install -Dm755 zig-out/bin/zap "$pkgdir/usr/bin/zap"
+  install -Dm644 packaging/zap.1 "$pkgdir/usr/share/man/man1/zap.1"
+  install -Dm644 packaging/completions/zap.bash "$pkgdir/usr/share/bash-completion/completions/zap"
+  install -Dm644 packaging/completions/_zap "$pkgdir/usr/share/zsh/site-functions/_zap"
+  install -Dm644 packaging/completions/zap.fish "$pkgdir/usr/share/fish/vendor_completions.d/zap.fish"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/zap/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/zap/LICENSE"
+}

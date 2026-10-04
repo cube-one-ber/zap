@@ -1,0 +1,108 @@
+.TH ZAP 1 "October 2026" "zap 0.1.0" "User Commands"
+.SH NAME
+zap \- native Zig AUR helper using libalpm and systemd run0
+.SH SYNOPSIS
+.B zap
+.I command
+.RI [ packages ]
+.RI [ options ]
+.SH DESCRIPTION
+zap searches repository and AUR packages, resolves dependencies, reviews
+PKGBUILDs, builds packages as the invoking user, and runs native libalpm
+transactions through systemd run0 and polkit. It never builds as root.
+System changes require an installed root-owned /usr/bin/zap and a terminal.
+.SH COMMANDS
+.TP
+.B search TERM (-Ss)
+Search cached repositories and live AUR metadata.
+.TP
+.B info PACKAGES (-Si)
+Display package details, dependencies and update dates.
+.TP
+.B install PACKAGES (-S)
+Review, build and install packages and their dependencies.
+.TP
+.B build PACKAGES
+Review and build AUR packages without installing. Build dependencies must
+already be installed.
+.TP
+.B get PACKAGES
+Fetch AUR sources into the user cache without executing them.
+.TP
+.B upgrade (-Syu)
+Refresh and upgrade repositories, then upgrade installed AUR packages.
+.TP
+.B updates (-Qu)
+Check cached repositories and live AUR for newer versions.
+.TP
+.B list [PACKAGES] (-Q)
+List installed versions, installation dates and reasons.
+.TP
+.B foreign (-Qm)
+List installed packages absent from repositories.
+.TP
+.B remove PACKAGES (-R)
+Remove packages with native dependency checks.
+.TP
+.B orphans
+List dependency packages without required or optional users.
+.TP
+.B autoremove
+Review and remove orphan dependencies.
+.TP
+.B clean
+Confirm and clear the user's AUR source/build cache.
+.TP
+.B version (--version)
+Display the version and libalpm ABI.
+.SH OPTIONS
+.TP
+.B --dry-run
+Skip builds, escalation and system changes. Install/build plans can fetch
+sources and ask for a provider. Final repository changes are resolved by
+libalpm during the actual transaction. get always fetches sources.
+.TP
+.B --devel
+Include installed -git, -svn, -hg and -bzr packages for rebuild during updates
+or upgrade.
+.TP
+.B --recursive
+Also remove unneeded dependencies with remove.
+.TP
+.B --nosave
+Discard backup configuration during remove. -Rns combines --recursive and
+--nosave.
+.SH DATES
+All dates are UTC. AUR results show last modification. Repository results
+show build dates. Local listings show installation dates.
+.SH SECURITY
+PKGBUILDs execute arbitrary code as your user after review. Review does not
+sandbox that code. Every system transaction requires a separate final
+confirmation and uses configured signature policies, ALPM locks and hooks.
+Approved archives are copied into private root-owned staging and checked
+against their SHA-256 digests before installation. AUR upgrades span several
+transactions; earlier successful installs remain if a later build fails.
+.SH FILES
+.TP
+.B /etc/pacman.conf
+Repository configuration and package/signature policies.
+.TP
+.B $XDG_CACHE_HOME/zap, $HOME/.cache/zap
+User-owned AUR source and build cache.
+.TP
+.B /usr/bin/zap
+Root-owned executable used by the transaction worker.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+Disable terminal styling.
+.TP
+.B XDG_CACHE_HOME
+Absolute user cache directory.
+.SH EXIT STATUS
+0 on success, 1 on failure, 130 on a cancelled operation.
+.SH SEE ALSO
+.BR pacman.conf (5),
+.BR makepkg (8),
+.BR run0 (1),
+.BR libalpm (3)
