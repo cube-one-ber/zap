@@ -1,32 +1,129 @@
-name: Build and test
-on: [push, pull_request]
+name: Build, test and pre-release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   arch:
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    timeout-minutes: 20
+    container:
+      image: archlinux:base-devel
+      # Bubblewrap's isolation tests need nested, unprivileged namespaces.
+      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Install native dependencies and Zig 0.15.2
-        shell: bash
         run: |
-          pacman -Syu --noconfirm curl git pkgconf systemd polkit
+          pacman -Syu --noconfirm curl git pkgconf systemd polkit bubblewrap
           curl -fL --proto '=https' --tlsv1.2 https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz
           echo '02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz' | sha256sum -c -
           tar -xf /tmp/zig.tar.xz -C /opt
           ln -s /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
           useradd -m builder
+
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Check formatting, compile, and test as a normal user
-        shell: bash
+
+      - name: Set development package version
+        id: version
+        run: |
+          base=$(sed -n 's/^pkgver=//p' packaging/PKGBUILD.in)
+          version="${base}.r$(git rev-list --count HEAD).g$(git rev-parse --short=12 HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "ZAP_PKGVER=$version" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+
+      - name: Check formatting and sandbox support as a normal user
         run: |
           chown -R builder:builder "$GITHUB_WORKSPACE"
-          # Drop container-root privileges; this does not grant elevated access.
-          runuser -u builder -- bash -c 'zig fmt --check build.zig src && zig build -Doptimize=ReleaseSafe && zig build test --summary all'
-      - name: Build the distributable Arch package
-        shell: bash
+          runuser -u builder -- zig fmt --check build.zig src
+          runuser -u builder -- bwrap --unshare-all --share-net --ro-bind / / -- /usr/bin/true
+
+      - name: Build and test the distributable Arch package
         run: |
+          # makepkg runs build() and check() without container-root privileges.
           runuser -u builder -- bash -c './packaging/source.sh && cd packaging && ZIG=/usr/local/bin/zig makepkg --noconfirm'
+
+      - name: Collect packages, source and checksums
+        run: |
+          mkdir -p dist
+          cp packaging/*.pkg.tar.zst packaging/zap-source.tar.gz packaging/PKGBUILD dist/
+          printf 'version=%s\ncommit=%s\narchitecture=x86_64\nzig=0.15.2\n' "$ZAP_PKGVER" "$GITHUB_SHA" > dist/build-info.txt
+          cd dist
+          sha256sum -- *.pkg.tar.zst zap-source.tar.gz PKGBUILD build-info.txt > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Save tested build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zap-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  pre-release:
+    needs: arch
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: zap-x86_64
+          path: dist
+
+      - name: Publish versioned pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.arch.outputs.version }}
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+          tag="v${RELEASE_VERSION}"
+          existing=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          if [[ "$existing" == false ]]; then
+            echo "Pre-release $tag is already published; keeping its original assets."
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/release-notes.md" <<NOTES
+          Automated development build from commit $GITHUB_SHA.
+
+          Includes the x86_64 Arch package, debug symbols, source archive, PKGBUILD, build information and SHA-256 checksums. The build and full test suite passed before publishing.
+
+          Download the main zap package (the debug package is optional), verify it with SHA256SUMS, then install it with:
+
+          \`run0 /usr/bin/pacman -U ./zap-${RELEASE_VERSION}-1-x86_64.pkg.tar.zst\`
+
+          This is a pre-release for Arch Linux, built against its current system libraries.
+          NOTES
+          if [[ "$existing" != true ]]; then
+            gh release create "$tag" --target "$GITHUB_SHA" \
+              --title "zap ${RELEASE_VERSION} (pre-release)" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --prerelease --draft --latest=false
+          fi
+          # Publish only after every asset has uploaded; interrupted drafts can be retried.
+          gh release upload "$tag" ./* --clobber
+          gh release edit "$tag" --draft=false --prerelease --latest=false
+          gh release view "$tag" --json url --jq '.url' >> "$GITHUB_STEP_SUMMARY"

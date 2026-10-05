@@ -20,6 +20,21 @@ The native Arch build links `/usr/lib/libalpm` and `/usr/lib/libcurl`. Zig suppl
 
 The test suite includes AUR API fixtures, name/manifest validation, signature policy parsing, terminal escape filtering, versioned dependencies, split-package providers, archive hashes and symlinks, exact artifact selection and duplicate/base validation, optional debug outputs, package destinations with spaces, native ALPM preparation/conflict tests in temporary databases, and an actual unprivileged makepkg build of a local fixture. Tests never install packages on the host or invoke run0. They also cover CLI scope/option validation, numeric selections, local source snapshots, RSS validation, installation reasons, and real sandboxed makepkg phases that cannot read a private file or change Git metadata. Tests require `bsdtar`, `git`, `makepkg`, `bubblewrap`, working unprivileged user namespaces, and the build tools in `base-devel`.
 
+## Automatic pre-releases
+
+Every successful push to `master` publishes a new [GitHub pre-release](https://github.com/cube-one-ber/zap/releases). The **Build, test and pre-release** workflow can also be run manually on `master`. Pull requests and other branches run the same checks and save build artifacts without publishing releases.
+
+The workflow builds an x86_64 Arch package with Zig 0.15.2, runs the full tests (including real sandboxed builds), and uploads the main package, optional debug symbols, source archive, generated PKGBUILD, build information, and `SHA256SUMS`. The version includes the Git revision count and commit, for example `0.1.0.r5.g0123456789ab`. Each pre-release is tied to its exact commit; rerunning a published build preserves its original release assets. Pre-releases do not replace the latest stable release.
+
+To install, download the main `zap-…-x86_64.pkg.tar.zst` asset and `SHA256SUMS` into the same directory, then run:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+run0 /usr/bin/pacman -U ./zap-…-x86_64.pkg.tar.zst
+```
+
+Replace the example filename with the downloaded asset's full filename. These packages target current Arch Linux system libraries; other architectures still require a native source build. Workflow artifacts are retained for 14 days; published release assets remain available.
+
 ## Install
 
 Read-only commands and `build` work directly from `zig-out/bin/zap`. System transactions require a **root-owned `/usr/bin/zap`**, with root-owned parent directories and no group/other write access. This prevents elevating a binary from a user-writable checkout.
