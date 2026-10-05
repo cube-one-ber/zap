@@ -59,6 +59,11 @@ Use the filename reported by makepkg for your architecture and compression setti
 
 The package includes a manual and Bash, Zsh, and Fish completions.
 
+An AUR submission recipe is maintained in [`packaging/aur`](packaging/aur/README.md).
+It builds a fixed, checksum-verified release using the versioned `zig0.15`
+compiler dependency. The submission uses the `zap` name and conflicts with the
+unrelated `zap-git` and `zap-bin` packages, which also install `/usr/bin/zap`.
+
 ## Commands
 
 | Command | Alias | Behavior |
