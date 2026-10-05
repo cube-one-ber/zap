@@ -25,14 +25,16 @@ pub const Package = struct {
         self.showSearch(null, null);
     }
     pub fn showSearch(self: Package, index: ?usize, installed: ?[]const u8) void {
-        const badge = if (installed) |old| std.fmt.allocPrint(u.a, " [installed{s}{s}]", .{ if (std.mem.eql(u8, old, self.Version)) @as([]const u8, "") else ": ", if (std.mem.eql(u8, old, self.Version)) @as([]const u8, "") else ui.safe(old) }) catch return else "";
-        const annotation = std.fmt.allocPrint(u.a, "({d} votes · pop {d:.2}){s}", .{ self.NumVotes, self.Popularity, badge }) catch return;
-        defer u.a.free(annotation);
-        ui.packageHeader(self.Name, self.Version, "aur", index, annotation);
+        const badge = if (installed) |old| std.fmt.allocPrint(u.a, "[installed{s}{s}]", .{ if (std.mem.eql(u8, old, self.Version)) @as([]const u8, "") else ": ", if (std.mem.eql(u8, old, self.Version)) @as([]const u8, "") else old }) catch return else "";
+        defer if (installed != null) u.a.free(badge);
+        ui.packageHeader(self.Name, self.Version, "aur", index, badge);
         if (self.Description) |description| ui.text(description, 4, .reset);
-        const meta = std.fmt.allocPrint(u.a, "Last modified {s} · {s}", .{ ui.date(self.LastModified), self.Maintainer orelse "unmaintained" }) catch return;
+        const meta = std.fmt.allocPrint(u.a, "{d} votes · popularity {d:.2} · {s}", .{ self.NumVotes, self.Popularity, self.Maintainer orelse "unmaintained" }) catch return;
         defer u.a.free(meta);
         ui.text(meta, 4, .muted);
+        const stamp = std.fmt.allocPrint(u.a, "Modified {s}", .{ui.date(self.LastModified)}) catch return;
+        defer u.a.free(stamp);
+        ui.text(stamp, 4, .muted);
         if (self.Maintainer == null) ui.note(.warning, "Unmaintained package");
         if (self.OutOfDate != null) ui.note(.warning, "Flagged out of date");
     }

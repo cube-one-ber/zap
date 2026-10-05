@@ -54,7 +54,10 @@ pub const Builder = struct {
         if (self.nodes.items.len > 0) try self.resolve("base-devel", false, 0);
         ui.title("Installation plan");
         ui.text(try std.fmt.allocPrint(u.a, "{d} repo · {d} build bases · {d} reason changes", .{ self.repos.items.len, self.order.items.len, self.reason_targets.items.len }), 2, .muted);
-        for (self.repos.items) |target| ui.packageHeader(target.name, "", "repo", null, if (target.dependency) "[dependency]" else "[requested]");
+        for (self.repos.items) |target| {
+            const p = try self.db.repo(target.name);
+            ui.packageHeader(target.name, if (p) |package| alpm.version(package) else "", "repo", null, if (target.dependency) "[dependency]" else "[requested]");
+        }
         for (self.reason_targets.items) |target| ui.text(try std.fmt.allocPrint(u.a, "{s} → {s}", .{ target.name, @tagName(target.reason.?) }), 2, .muted);
         for (self.order.items) |idx| {
             const node = self.nodes.items[idx];
@@ -66,7 +69,7 @@ pub const Builder = struct {
         if (self.repos.items.len == 0 and self.order.items.len == 0 and self.reason_targets.items.len == 0) ui.note(.success, "No changes needed.");
     }
     fn skipInstalled(self: *Builder, old: alpm.Pkg) !void {
-        ui.print("Already installed: {s} {s}\n", .{ ui.safe(alpm.name(old)), ui.safe(alpm.version(old)) });
+        ui.note(.success, try std.fmt.allocPrint(u.a, "Already installed · {s} {s}", .{ alpm.name(old), alpm.version(old) }));
         const reason = self.reason orelse .explicit;
         const desired: c.alpm_pkgreason_t = if (reason == .explicit) c.ALPM_PKG_REASON_EXPLICIT else c.ALPM_PKG_REASON_DEPEND;
         if (c.alpm_pkg_get_reason(old) != desired) try self.reason_targets.append(u.a, .{ .name = alpm.name(old), .reason = reason });
@@ -134,8 +137,8 @@ pub const Builder = struct {
                 return error.UnsatisfiedDependency;
             }
             if (matches.items.len == 1) selected = matches.items[0] else {
-                ui.print("AUR providers for {s}:\n", .{ui.safe(dep)});
-                for (matches.items, 0..) |p, i| ui.print("  {d}. {s} {s}\n", .{ i + 1, ui.safe(p.Name), ui.safe(p.Version) });
+                ui.title(try std.fmt.allocPrint(u.a, "Choose a provider · {s}", .{dep}));
+                for (matches.items, 0..) |p, i| ui.packageHeader(p.Name, p.Version, "aur", i + 1, "");
                 const reply = try ui.answer("Select provider: ");
                 const index = try std.fmt.parseInt(usize, reply, 10);
                 if (index == 0 or index > matches.items.len) return error.InvalidProvider;
@@ -302,7 +305,7 @@ pub const Builder = struct {
             // Probe before source approval or dependency installation. Failure never falls back.
             const probe = self.makepkgArgs(self.nodes.items[self.order.items[0]].dir, &.{"/usr/bin/true"}) catch return error.BuildSandboxUnavailable;
             u.run(probe, null) catch return error.BuildSandboxUnavailable;
-            ui.print("Build isolation: private home, read-only system and database; source downloads can access the network.\n", .{});
+            ui.note(.muted, "Build isolation · private home, read-only system and database; network access for source downloads.");
         }
         // Review every package base before executing any PKGBUILD code or changing the system.
         for (self.order.items, 1..) |idx, step| {

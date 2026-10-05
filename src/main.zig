@@ -71,7 +71,17 @@ fn dispatch() !void {
             if (matches.len == 0) return error.PackageNotFound;
             ui.title("Choose packages to install");
             ui.text("Use the numbers beside the search results. Separate choices with spaces or commas; use a dash for ranges.", 2, .muted);
-            const selected = try query.selection(try ui.answer("Numbers or ranges (e.g. 1 3-5); empty cancels: "), matches.len);
+            const selected = while (true) {
+                const reply = try ui.answer("Packages (e.g. 1 3-5); empty cancels: ");
+                defer u.a.free(reply);
+                const result = query.selection(reply, matches.len) catch |err| {
+                    if (err != error.InvalidSelection) return err;
+                    ui.print("\n", .{});
+                    ui.note(.warning, try std.fmt.allocPrint(u.a, "Use numbers from 1 to {d}, or ranges such as 1-3.", .{matches.len}));
+                    continue;
+                };
+                break result;
+            };
             var names: std.ArrayList([]const u8) = .empty;
             var aur_names: std.ArrayList([]const u8) = .empty;
             for (selected) |index| {
@@ -250,6 +260,9 @@ fn requireNames(names: []const []const u8) !void {
 }
 fn updates(db: *alpm.Alpm, o: cli.Options) ![]const []const u8 {
     if (!o.quiet) ui.title("Available updates");
+    const Update = struct { name: []const u8, old: []const u8, new: []const u8, source: []const u8, updated: i64, vcs: bool = false };
+    var rows: std.ArrayList(Update) = .empty;
+    defer rows.deinit(u.a);
     var foreign: std.ArrayList([]const u8) = .empty;
     var it = db.installed();
     var count: usize = 0;
@@ -260,9 +273,7 @@ fn updates(db: *alpm.Alpm, o: cli.Options) ![]const []const u8 {
             if (o.scope != .repo) try foreign.append(u.a, alpm.name(p));
         } else if (o.scope != .aur) if (c.alpm_sync_get_new_version(p, c.alpm_get_syncdbs(db.h))) |next| {
             if (o.quiet) ui.print("{s}\n", .{ui.safe(alpm.name(p))}) else {
-                ui.change(alpm.name(p), alpm.version(p), alpm.version(next), "repo");
-                ui.field("Build date", ui.date(c.alpm_pkg_get_builddate(next)));
-                ui.print("\n", .{});
+                try rows.append(u.a, .{ .name = alpm.name(p), .old = alpm.version(p), .new = alpm.version(next), .source = "repo", .updated = c.alpm_pkg_get_builddate(next) });
             }
             count += 1;
         };
@@ -277,14 +288,22 @@ fn updates(db: *alpm.Alpm, o: cli.Options) ![]const []const u8 {
         };
         if (c.alpm_pkg_vercmp((try u.z(p.Version)).ptr, (try u.z(alpm.version(old))).ptr) > 0 or vcs) {
             if (o.quiet) ui.print("{s}\n", .{p.Name}) else {
-                ui.change(p.Name, alpm.version(old), p.Version, "AUR");
-                ui.field("Last modified", ui.date(p.LastModified));
-                if (vcs) ui.note(.warning, "VCS rebuild requested");
-                ui.print("\n", .{});
+                try rows.append(u.a, .{ .name = p.Name, .old = alpm.version(old), .new = p.Version, .source = "AUR", .updated = p.LastModified, .vcs = vcs });
             }
             try targets.append(u.a, p.Name);
             count += 1;
         }
+    }
+    if (rows.items.len > 0) {
+        var table: ui.ChangeTable = .{};
+        for (rows.items) |row| table.include(row.name, row.old, row.new, row.source);
+        table.heading("Source");
+        for (rows.items) |row| {
+            table.row(row.name, row.old, row.new, row.source);
+            ui.text(try std.fmt.allocPrint(u.a, "{s} {s}{s}", .{ if (std.mem.eql(u8, row.source, "repo")) @as([]const u8, "Built") else "Modified", ui.date(row.updated), if (row.vcs) @as([]const u8, " · VCS rebuild") else "" }), 4, if (row.vcs) .warning else .muted);
+        }
+        ui.print("\n", .{});
+        ui.text(try std.fmt.allocPrint(u.a, "{d} package{s} to update · zap upgrade to apply", .{ count, if (count == 1) @as([]const u8, "") else "s" }), 2, .muted);
     }
     if (count == 0 and !o.quiet) ui.note(.success, "Everything is up to date in the cached databases.");
     for (foreign.items) |name| {

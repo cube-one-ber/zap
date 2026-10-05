@@ -4,11 +4,18 @@ const c = u.c;
 const signals = @import("signals.zig");
 
 pub fn print(comptime fmt: []const u8, args: anytype) void {
+    clearProgress();
     const s = std.fmt.allocPrint(u.a, fmt, args) catch return;
     defer u.a.free(s);
+    write(s);
+}
+fn write(s: []const u8) void {
+    writeTo(if (@import("builtin").is_test) 2 else 1, s);
+}
+fn writeTo(fd: std.posix.fd_t, s: []const u8) void {
     var offset: usize = 0;
     while (offset < s.len) {
-        const n = std.posix.write(if (@import("builtin").is_test) 2 else 1, s[offset..]) catch return;
+        const n = std.posix.write(fd, s[offset..]) catch return;
         if (n == 0) return;
         offset += n;
     }
@@ -39,7 +46,10 @@ pub fn title(s: []const u8) void {
     const heading = std.fmt.allocPrint(u.a, "› {s}", .{s}) catch return;
     defer u.a.free(heading);
     print("\n", .{});
-    text(heading, 0, .accent);
+    if (displayWidth(heading) + 3 >= columns()) return text(heading, 0, .accent);
+    print("{s}{s}{s} {s}", .{ style(.accent), heading, style(.reset), style(.muted) });
+    for (0..columns() - displayWidth(heading) - 1) |_| print("─", .{});
+    print("{s}\n", .{style(.reset)});
 }
 pub fn safe(s: []const u8) []const u8 {
     const result = u.a.dupe(u8, s) catch return "";
@@ -109,6 +119,107 @@ fn padding(count: usize) []const u8 {
     const spaces = "                                                                                                                                ";
     return spaces[0..@min(count, spaces.len)];
 }
+// Keep names readable in a transient status line without splitting UTF-8.
+pub fn clipped(s: []const u8, width: usize) ![]const u8 {
+    if (displayWidth(s) <= width) return u.a.dupe(u8, s);
+    if (width == 0) return u.a.dupe(u8, "");
+    var end: usize = 0;
+    var cells: usize = 0;
+    while (end < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[end]) catch 1;
+        const next = @min(end + len, s.len);
+        const count = cellWidth(s[end..next]);
+        if (cells + count > width - 1) break;
+        cells += count;
+        end = next;
+    }
+    return std.fmt.allocPrint(u.a, "{s}…", .{s[0..end]});
+}
+
+pub const ChangeTable = struct {
+    widths: [4]usize = .{ 7, 7, 6, 6 },
+    pub fn include(self: *ChangeTable, name: []const u8, old: []const u8, new: []const u8, action: []const u8) void {
+        for ([_][]const u8{ name, old, new, action }, 0..) |value, i| {
+            const clean = safe(value);
+            defer u.a.free(clean);
+            self.widths[i] = @max(self.widths[i], displayWidth(clean));
+        }
+    }
+    pub fn fits(self: ChangeTable, width: usize) bool {
+        return 8 + self.widths[0] + self.widths[1] + self.widths[2] + self.widths[3] <= width;
+    }
+    pub fn heading(self: ChangeTable, last_label: []const u8) void {
+        if (!self.fits(columns())) return;
+        self.cells(.{ "Package", "Current", "Target", last_label }, .{ .muted, .muted, .muted, .muted });
+    }
+    pub fn row(self: ChangeTable, name: []const u8, old: []const u8, new: []const u8, action: []const u8) void {
+        if (!self.fits(columns())) return change(name, old, new, action);
+        self.cells(.{ name, old, new, action }, .{ .bold, .muted, if (std.mem.eql(u8, action, "remove")) .danger else .success, if (std.mem.eql(u8, action, "remove")) .danger else if (std.mem.eql(u8, action, "downgrade")) .warning else .accent });
+    }
+    fn cells(self: ChangeTable, values: [4][]const u8, tones: [4]Tone) void {
+        print("  ", .{});
+        for (values, 0..) |value, i| {
+            const clean = safe(value);
+            defer u.a.free(clean);
+            print("{s}{s}{s}", .{ style(tones[i]), clean, style(.reset) });
+            if (i < 3) print("{s}", .{padding(2 + self.widths[i] -| displayWidth(clean))});
+        }
+        print("\n", .{});
+    }
+};
+
+var progress_active = false;
+var progress_key: ?u64 = null;
+var progress_percent: usize = 0;
+var progress_time: i64 = 0;
+fn clearProgress() void {
+    if (!progress_active) return;
+    write("\r\x1b[2K");
+    progress_active = false;
+}
+pub fn progress(label: []const u8, name: []const u8, percent: usize, current: usize, total: usize) void {
+    const value: usize = @min(percent, 100);
+    const key = progressKey(label, name, current, total);
+    const now = std.time.milliTimestamp();
+    const same = progress_key != null and progress_key.? == key;
+    if (same and (progress_percent == value or (value < 100 and now - progress_time < 100))) return;
+    progress_key = key;
+    progress_percent = value;
+    progress_time = now;
+    const message = std.fmt.allocPrint(u.a, "{s}{s}{s}", .{ label, if (name.len > 0) @as([]const u8, " ") else "", name }) catch return;
+    defer u.a.free(message);
+    if (color("yes").len == 0 or columns() < 40) {
+        if (value == 100) note(.success, message);
+        return;
+    }
+    const clean = safe(message);
+    defer u.a.free(clean);
+    const count = if (total > 0) std.fmt.allocPrint(u.a, " · {d}/{d}", .{ current, total }) catch return else u.a.dupe(u8, "") catch return;
+    defer u.a.free(count);
+    const bar_width: usize = @min(columns() / 5, 18);
+    const available = columns() -| (bar_width + displayWidth(count) + 13);
+    const caption = clipped(clean, available) catch return;
+    defer u.a.free(caption);
+    const filled = value * bar_width / 100;
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(u.a);
+    line.appendSlice(u.a, "\r\x1b[2K  ") catch return;
+    line.appendSlice(u.a, caption) catch return;
+    line.appendNTimes(u.a, ' ', available -| displayWidth(caption)) catch return;
+    line.appendSlice(u.a, style(.accent)) catch return;
+    line.appendSlice(u.a, "  [") catch return;
+    for (0..bar_width) |i| line.appendSlice(u.a, if (i < filled) "━" else "─") catch return;
+    const tail = std.fmt.allocPrint(u.a, "]{s} {d: >3}%{s}{s}{s}{s}", .{ style(.reset), value, style(.muted), count, style(.reset), if (value == 100) @as([]const u8, "\n") else "" }) catch return;
+    defer u.a.free(tail);
+    line.appendSlice(u.a, tail) catch return;
+    write(line.items);
+    progress_active = value < 100;
+}
+fn progressKey(label: []const u8, name: []const u8, current: usize, total: usize) u64 {
+    const counters = [2]usize{ current, total };
+    const seed = std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, label), name);
+    return std.hash.Wyhash.hash(seed, std.mem.asBytes(&counters));
+}
 pub fn field(label: []const u8, value: []const u8) void {
     const clean = safe(if (value.len == 0) "none" else value);
     defer u.a.free(clean);
@@ -132,6 +243,19 @@ pub fn note(tone: Tone, message: []const u8) void {
     const content = std.fmt.allocPrint(u.a, "{s}{s}", .{ label, message }) catch return;
     defer u.a.free(content);
     text(content, 2, tone);
+}
+// Library diagnostics stay on stderr and cannot overwrite a live status bar.
+pub fn diagnostic(tone: Tone, message: []const u8) void {
+    clearProgress();
+    const clean = safe(std.mem.trim(u8, message, " \r\n"));
+    defer u.a.free(clean);
+    const caption = std.fmt.allocPrint(u.a, "libalpm · {s}", .{clean}) catch return;
+    defer u.a.free(caption);
+    const content = wrapped(caption, columns(), 4) catch return;
+    defer u.a.free(content);
+    const line = std.fmt.allocPrint(u.a, "    {s}{s}{s}\n", .{ style(tone), content, style(.reset) }) catch return;
+    defer u.a.free(line);
+    writeTo(2, line);
 }
 pub fn date(timestamp: i64) []const u8 {
     if (timestamp <= 0) return "unknown";
@@ -190,17 +314,17 @@ pub fn packageHeader(name: []const u8, version: []const u8, source: []const u8, 
     if (base_width <= columns()) {
         print("{s}{s}{s}{s}{s}/{s}{s}{s}{s} {s}{s}{s}", .{ style(.muted), prefix, style(.reset), style(.accent), clean_source, style(.reset), style(.bold), clean_name, style(.reset), style(.success), clean_version, style(.reset) });
         if (clean_annotation.len > 0 and base_width + displayWidth(clean_annotation) + 2 <= columns()) {
-            print("  {s}{s}{s}\n", .{ style(.muted), clean_annotation, style(.reset) });
+            print("  {s}{s}{s}\n", .{ style(if (std.mem.startsWith(u8, clean_annotation, "[installed")) .success else .muted), clean_annotation, style(.reset) });
         } else {
             print("\n", .{});
-            if (clean_annotation.len > 0) text(clean_annotation, 4, .muted);
+            if (clean_annotation.len > 0) text(clean_annotation, 4, if (std.mem.startsWith(u8, clean_annotation, "[installed")) .success else .muted);
         }
     } else {
         const numbered = std.fmt.allocPrint(u.a, "{s}{s}", .{ prefix, heading }) catch return;
         defer u.a.free(numbered);
         text(numbered, 0, .bold);
         text(clean_version, 4, .success);
-        if (clean_annotation.len > 0) text(clean_annotation, 4, .muted);
+        if (clean_annotation.len > 0) text(clean_annotation, 4, if (std.mem.startsWith(u8, clean_annotation, "[installed")) .success else .muted);
     }
 }
 pub fn package(name: []const u8, version: []const u8, source: []const u8, date_label: []const u8, updated: i64, description: []const u8, index: ?usize) void {
@@ -224,8 +348,8 @@ pub fn change(name: []const u8, old: []const u8, new: []const u8, source: []cons
     const line = std.fmt.allocPrint(u.a, "{s}  {s} → {s}  [{s}]", .{ clean_name, clean_old, clean_new, clean_source }) catch return;
     defer u.a.free(line);
     if (displayWidth(line) + 2 <= columns()) {
-        print("  {s}{s}{s}  {s}{s}{s} → {s}{s}{s}  {s}[{s}]{s}\n", .{ style(.bold), clean_name, style(.reset), style(.muted), clean_old, style(.reset), style(.success), clean_new, style(.reset), style(.muted), clean_source, style(.reset) });
-    } else text(line, 2, .success);
+        print("  {s}{s}{s}  {s}{s}{s} → {s}{s}{s}  {s}[{s}]{s}\n", .{ style(.bold), clean_name, style(.reset), style(.muted), clean_old, style(.reset), style(if (std.mem.eql(u8, source, "remove")) .danger else .success), clean_new, style(.reset), style(.muted), clean_source, style(.reset) });
+    } else text(line, 2, if (std.mem.eql(u8, source, "remove")) .danger else .success);
 }
 pub fn installed(name: []const u8, version: []const u8, timestamp: i64, reason: []const u8) void {
     const clean_name = safe(name);
@@ -278,4 +402,36 @@ test "terminal wrapping preserves words, long tokens and UTF-8" {
         defer u.a.free(result);
         try std.testing.expectEqualStrings(case[3], result);
     }
+}
+
+test "status captions keep valid Unicode within a terminal cell budget" {
+    _ = c.setlocale(c.LC_CTYPE, "C.UTF-8");
+    for ([_][]const u8{ "a long package name", "日本語のパッケージ", "café e\u{0301}clair" }) |caption| {
+        for (0..12) |width| {
+            const result = try clipped(caption, width);
+            defer u.a.free(result);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+            try std.testing.expect(displayWidth(result) <= width);
+        }
+    }
+}
+
+test "version tables account for Unicode, escapes and long versions before fitting" {
+    _ = c.setlocale(c.LC_CTYPE, "C.UTF-8");
+    var table: ChangeTable = .{};
+    table.include("日本語-package\x1b", "1.0", "2.0.r1234567890.gabcdef123456", "upgrade");
+    try std.testing.expect(!table.fits(40));
+    try std.testing.expect(table.fits(100));
+    const clean = safe("日本語-package\x1b");
+    defer u.a.free(clean);
+    try std.testing.expectEqual(displayWidth(clean), table.widths[0]);
+}
+
+test "repeated progress identities support long names and distinguish phase and count" {
+    const name = "日本語-terminal-with-an-extraordinarily-long-name";
+    const key = progressKey("Upgrading", name, 1, 3);
+    for (0..10) |_| try std.testing.expectEqual(key, progressKey("Upgrading", name, 1, 3));
+    try std.testing.expect(key != progressKey("Installing", name, 1, 3));
+    try std.testing.expect(key != progressKey("Upgrading", name, 2, 3));
+    try std.testing.expect(key != progressKey("Upgrading", name, 1, 4));
 }

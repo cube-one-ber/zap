@@ -5,6 +5,9 @@ const ui = @import("ui.zig");
 const config = @import("config.zig");
 const signals = @import("signals.zig");
 extern fn zap_set_log_callback(handle: *c.alpm_handle_t) c_int;
+export fn zap_log_message(level: c_int, message: [*c]const u8) callconv(.c) void {
+    ui.diagnostic(if (level & c.ALPM_LOG_ERROR != 0) .danger else .warning, u.str(message));
+}
 pub const Pkg = *c.alpm_pkg_t;
 pub fn pkg(data: ?*anyopaque) Pkg {
     return @ptrCast(@alignCast(data.?));
@@ -22,7 +25,7 @@ pub fn showSearch(p: Pkg, index: ?usize, installed: ?[]const u8) void {
     const annotation = if (installed) |old| std.fmt.allocPrint(u.a, "[installed{s}{s}]", .{ if (std.mem.eql(u8, old, version(p))) @as([]const u8, "") else ": ", if (std.mem.eql(u8, old, version(p))) @as([]const u8, "") else ui.safe(old) }) catch return else "";
     ui.packageHeader(name(p), version(p), u.str(c.alpm_db_get_name(c.alpm_pkg_get_db(p))), index, annotation);
     ui.text(u.str(c.alpm_pkg_get_desc(p)), 4, .reset);
-    const stamp = std.fmt.allocPrint(u.a, "Build date {s}", .{ui.date(c.alpm_pkg_get_builddate(p))}) catch return;
+    const stamp = std.fmt.allocPrint(u.a, "{d:.1} MiB installed · built {s}", .{ @as(f64, @floatFromInt(c.alpm_pkg_get_isize(p))) / (1024 * 1024), ui.date(c.alpm_pkg_get_builddate(p)) }) catch return;
     defer u.a.free(stamp);
     ui.text(stamp, 4, .muted);
 }
@@ -217,15 +220,11 @@ fn event(ctx: ?*anyopaque, e: [*c]c.alpm_event_t) callconv(.c) void {
         return;
     }
     switch (e.*.type) {
-        c.ALPM_EVENT_PACKAGE_OPERATION_START => {
-            const p = e.*.package_operation.newpkg orelse e.*.package_operation.oldpkg orelse return;
-            ui.print("  Processing {s}\n", .{ui.safe(name(p))});
-        },
         c.ALPM_EVENT_SCRIPTLET_INFO => ui.print("  {s}\n", .{ui.safe(u.str(e.*.scriptlet_info.line))}),
-        c.ALPM_EVENT_HOOK_RUN_START => ui.print("  Hook {d}/{d}: {s}\n", .{ e.*.hook_run.position, e.*.hook_run.total, ui.safe(u.str(e.*.hook_run.desc)) }),
-        c.ALPM_EVENT_PACNEW_CREATED => ui.print("  Review {s}.pacnew\n", .{ui.safe(u.str(e.*.pacnew_created.file))}),
-        c.ALPM_EVENT_PACSAVE_CREATED => ui.print("  Saved {s}.pacsave\n", .{ui.safe(u.str(e.*.pacsave_created.file))}),
-        c.ALPM_EVENT_PKG_RETRIEVE_START => ui.print("  Downloading {d} packages ({d} MiB)\n", .{ e.*.pkg_retrieve.num, @divTrunc(e.*.pkg_retrieve.total_size, 1024 * 1024) }),
+        c.ALPM_EVENT_HOOK_RUN_START => ui.text(std.fmt.allocPrint(u.a, "Hook {d}/{d} · {s}", .{ e.*.hook_run.position, e.*.hook_run.total, u.str(e.*.hook_run.desc) }) catch return, 2, .muted),
+        c.ALPM_EVENT_PACNEW_CREATED => ui.note(.warning, std.fmt.allocPrint(u.a, "Review {s}.pacnew", .{u.str(e.*.pacnew_created.file)}) catch return),
+        c.ALPM_EVENT_PACSAVE_CREATED => ui.note(.warning, std.fmt.allocPrint(u.a, "Saved {s}.pacsave", .{u.str(e.*.pacsave_created.file)}) catch return),
+        c.ALPM_EVENT_PKG_RETRIEVE_START => ui.title(std.fmt.allocPrint(u.a, "Download · {d} packages · {d:.1} MiB", .{ e.*.pkg_retrieve.num, @as(f64, @floatFromInt(e.*.pkg_retrieve.total_size)) / (1024 * 1024) }) catch return),
         else => {},
     }
 }
@@ -237,6 +236,23 @@ fn conflictName(value: anytype) []const u8 {
     };
 }
 
-fn progress(ctx: ?*anyopaque, _: c.alpm_progress_t, _: [*c]const u8, _: c_int, _: usize, _: usize) callconv(.c) void {
-    if (signals.cancelled.load(.monotonic)) _ = c.alpm_trans_interrupt(@ptrCast(ctx));
+fn progress(ctx: ?*anyopaque, stage: c.alpm_progress_t, package_name: [*c]const u8, percent: c_int, total: usize, current: usize) callconv(.c) void {
+    if (signals.cancelled.load(.monotonic)) {
+        _ = c.alpm_trans_interrupt(@ptrCast(ctx));
+        return;
+    }
+    const label: []const u8 = switch (stage) {
+        c.ALPM_PROGRESS_ADD_START => "Installing",
+        c.ALPM_PROGRESS_UPGRADE_START => "Upgrading",
+        c.ALPM_PROGRESS_DOWNGRADE_START => "Downgrading",
+        c.ALPM_PROGRESS_REINSTALL_START => "Reinstalling",
+        c.ALPM_PROGRESS_REMOVE_START => "Removing",
+        c.ALPM_PROGRESS_CONFLICTS_START => "Checking conflicts",
+        c.ALPM_PROGRESS_DISKSPACE_START => "Checking disk space",
+        c.ALPM_PROGRESS_INTEGRITY_START => "Verifying packages",
+        c.ALPM_PROGRESS_LOAD_START => "Loading packages",
+        c.ALPM_PROGRESS_KEYRING_START => "Checking keyring",
+        else => return,
+    };
+    ui.progress(label, u.str(package_name), @intCast(@max(percent, 0)), current, total);
 }

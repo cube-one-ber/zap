@@ -13,7 +13,10 @@ pub fn search(db: *alpm.Alpm, o: cli.Options) ![]Match {
     if (o.scope != .aur) {
         if (!o.quiet) ui.title(try std.fmt.allocPrint(u.a, "Repository results for {s}", .{term}));
         const packages = try repositorySearch(db, term, false);
-        for (packages) |p| {
+        if (!o.quiet and packages.len > 0) ui.text(try std.fmt.allocPrint(u.a, "{d} matches · configured repositories", .{packages.len}), 2, .muted);
+        if (!o.quiet and packages.len > 0) ui.print("\n", .{});
+        for (packages, 0..) |p, i| {
+            if (!o.quiet and i > 0) ui.print("\n", .{});
             if (o.quiet) ui.print("{s}\n", .{ui.safe(alpm.name(p))}) else {
                 alpm.showSearch(p, if (o.command == .select) matches.items.len + 1 else null, try installedVersion(db, alpm.name(p)));
             }
@@ -25,7 +28,10 @@ pub fn search(db: *alpm.Alpm, o: cli.Options) ![]Match {
         if (!o.quiet) ui.title(try std.fmt.allocPrint(u.a, "AUR results for {s}", .{term}));
         const packages = try aur.search(term, o.search_by);
         std.mem.sort(aur.Package, packages, o.sort_by, sortAur);
-        for (packages) |p| {
+        if (!o.quiet and packages.len > 0) ui.text(try std.fmt.allocPrint(u.a, "{d} matches · sorted by {s}", .{ packages.len, o.sort_by }), 2, .muted);
+        if (!o.quiet and packages.len > 0) ui.print("\n", .{});
+        for (packages, 0..) |p, i| {
+            if (!o.quiet and i > 0) ui.print("\n", .{});
             if (o.quiet) ui.print("{s}\n", .{p.Name}) else {
                 p.showSearch(if (o.command == .select) matches.items.len + 1 else null, try installedVersion(db, p.Name));
             }

@@ -179,27 +179,38 @@ pub fn worker(bytes: []const u8) !void {
     }
     ui.title("System transaction");
     for (reason_changes.items) |target| showReason(target, old_explicit.contains(target.name));
+    var table: ui.ChangeTable = .{};
+    var scan = additions;
+    while (scan != null) : (scan = scan.*.next) {
+        const p = alpm.pkg(scan.*.data);
+        const old = c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), c.alpm_pkg_get_name(p));
+        table.include(alpm.name(p), if (old) |previous| alpm.version(previous) else "—", alpm.version(p), action(p, old));
+    }
+    scan = removals;
+    while (scan != null) : (scan = scan.*.next) {
+        const p = alpm.pkg(scan.*.data);
+        table.include(alpm.name(p), alpm.version(p), "—", "remove");
+    }
+    table.heading("Action");
     var size: i64 = 0;
+    var download: i64 = 0;
     var add_count: usize = 0;
     var remove_count: usize = 0;
     var it = additions;
     while (it != null) : (it = it.*.next) {
         const p = alpm.pkg(it.*.data);
         size += c.alpm_pkg_get_isize(p);
+        download += c.alpm_pkg_download_size(p);
         const old = c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), c.alpm_pkg_get_name(p));
         if (old) |previous| size -= c.alpm_pkg_get_isize(previous);
-        const action: []const u8 = if (old) |previous| blk: {
-            const cmp = c.alpm_pkg_vercmp(c.alpm_pkg_get_version(p), c.alpm_pkg_get_version(previous));
-            break :blk if (cmp > 0) "upgrade" else if (cmp < 0) "downgrade" else "reinstall";
-        } else "install";
-        ui.change(alpm.name(p), if (old) |previous| alpm.version(previous) else "new", alpm.version(p), action);
+        table.row(alpm.name(p), if (old) |previous| alpm.version(previous) else "—", alpm.version(p), action(p, old));
         add_count += 1;
     }
     it = removals;
     while (it != null) : (it = it.*.next) {
         const p = alpm.pkg(it.*.data);
         size -= c.alpm_pkg_get_isize(p);
-        ui.text(try std.fmt.allocPrint(u.a, "− {s} {s}  [remove]", .{ alpm.name(p), alpm.version(p) }), 2, .danger);
+        table.row(alpm.name(p), alpm.version(p), "—", "remove");
         remove_count += 1;
         for (db.cfg.hold.items) |held| if (c.fnmatch((try u.z(held)).ptr, c.alpm_pkg_get_name(p), 0) == 0) {
             ui.print("Protected by HoldPkg: {s}\n", .{ui.safe(held)});
@@ -209,6 +220,7 @@ pub fn worker(bytes: []const u8) !void {
     ui.print("\n", .{});
     ui.field("Add / upgrade", try std.fmt.allocPrint(u.a, "{d} packages", .{add_count}));
     ui.field("Remove", try std.fmt.allocPrint(u.a, "{d} packages", .{remove_count}));
+    ui.field("Download", try std.fmt.allocPrint(u.a, "{d:.1} MiB", .{@as(f64, @floatFromInt(download)) / (1024 * 1024)}));
     ui.field("Installed size change", try std.fmt.allocPrint(u.a, "{s}{d:.1} MiB", .{ if (size > 0) @as([]const u8, "+") else "", @as(f64, @floatFromInt(size)) / (1024 * 1024) }));
     try ui.require("\nCommit this transaction, including package scripts and hooks? [y/N] ");
     try signals.check();
@@ -225,6 +237,11 @@ pub fn worker(bytes: []const u8) !void {
     };
     ui.print("\n", .{});
     ui.note(.success, "Transaction complete.");
+}
+fn action(p: alpm.Pkg, old: ?alpm.Pkg) []const u8 {
+    const previous = old orelse return "install";
+    const cmp = c.alpm_pkg_vercmp(c.alpm_pkg_get_version(p), c.alpm_pkg_get_version(previous));
+    return if (cmp > 0) "upgrade" else if (cmp < 0) "downgrade" else "reinstall";
 }
 pub fn flags(request: Request) c_int {
     return (if (request.needed) @as(c_int, c.ALPM_TRANS_FLAG_NEEDED) else @as(c_int, 0)) | (if (request.operation == .remove and request.recursive) @as(c_int, c.ALPM_TRANS_FLAG_RECURSE) else @as(c_int, 0)) | (if (request.nosave) @as(c_int, c.ALPM_TRANS_FLAG_NOSAVE) else @as(c_int, 0));
