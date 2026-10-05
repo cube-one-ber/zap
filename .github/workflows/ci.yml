@@ -14,27 +14,11 @@ concurrency:
 
 jobs:
   arch:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
-    container:
-      image: archlinux:base-devel
-      # Bubblewrap's isolation tests need nested, unprivileged namespaces.
-      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
-    defaults:
-      run:
-        shell: bash
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Install native dependencies and Zig 0.15.2
-        run: |
-          pacman -Syu --noconfirm curl git pkgconf systemd polkit bubblewrap
-          curl -fL --proto '=https' --tlsv1.2 https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz
-          echo '02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz' | sha256sum -c -
-          tar -xf /tmp/zig.tar.xz -C /opt
-          ln -s /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
-          useradd -m builder
-
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -44,31 +28,24 @@ jobs:
       - name: Set development package version
         id: version
         run: |
-          chown -R builder:builder "$GITHUB_WORKSPACE"
           base=$(sed -n 's/^pkgver=//p' packaging/PKGBUILD.in)
-          version="${base}.r$(runuser -u builder -- git rev-list --count HEAD).g$(runuser -u builder -- git rev-parse --short=12 HEAD)"
+          version="${base}.r$(git rev-list --count HEAD).g$(git rev-parse --short=12 HEAD)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "ZAP_PKGVER=$version" >> "$GITHUB_ENV"
-          echo "SOURCE_DATE_EPOCH=$(runuser -u builder -- git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
 
-      - name: Check formatting and sandbox support as a normal user
+      - name: Enable sandbox namespaces on the disposable runner
         run: |
-          runuser -u builder -- zig fmt --check build.zig src
-          runuser -u builder -- bwrap --unshare-all --share-net --ro-bind / / -- /usr/bin/true
+          # Ubuntu's host policy otherwise denies bubblewrap's UID mapping in Docker.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-      - name: Build and test the distributable Arch package
+      - name: Build and test in Arch Linux
         run: |
-          # makepkg runs build() and check() without container-root privileges.
-          runuser -u builder -- bash -c './packaging/source.sh && cd packaging && ZIG=/usr/local/bin/zig makepkg --noconfirm'
-
-      - name: Collect packages, source and checksums
-        run: |
-          mkdir -p dist
-          cp packaging/*.pkg.tar.zst packaging/zap-source.tar.gz packaging/PKGBUILD dist/
-          printf 'version=%s\ncommit=%s\narchitecture=x86_64\nzig=0.15.2\n' "$ZAP_PKGVER" "$GITHUB_SHA" > dist/build-info.txt
-          cd dist
-          sha256sum -- *.pkg.tar.zst zap-source.tar.gz PKGBUILD build-info.txt > SHA256SUMS
-          sha256sum -c SHA256SUMS
+          docker run --rm \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --volume "$GITHUB_WORKSPACE:/workspace" --workdir /workspace \
+            --env BUILD_UID="$(id -u)" --env ZAP_PKGVER --env SOURCE_DATE_EPOCH --env GITHUB_SHA \
+            archlinux:base-devel bash .github/scripts/build-arch.sh
 
       - name: Save tested build artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
