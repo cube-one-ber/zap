@@ -55,8 +55,15 @@ fn text(input: []const u8) ![]const u8 {
 }
 pub fn show() !void {
     const items = try decode(try @import("aur.zig").get("https://archlinux.org/feeds/news/"));
-    ui.title("Recent Arch Linux news · read intervention notices before upgrading");
-    for (items[0..@min(10, items.len)]) |item| ui.print("{s}\n  {s}\n  {s}\n\n", .{ ui.safe(item.title), ui.safe(item.date), ui.safe(item.link) });
+    ui.title("Arch Linux news");
+    ui.note(.warning, "Read intervention notices before upgrading.");
+    ui.print("\n", .{});
+    for (items[0..@min(10, items.len)]) |item| {
+        ui.text(item.title, 2, .bold);
+        ui.text(item.date, 4, .muted);
+        ui.text(item.link, 4, .accent);
+        ui.print("\n", .{});
+    }
 }
 test "news entities are decoded without external expansion and links stay on Arch" {
     const good = "<rss version=\"2\"><item><title>Action &amp; update &gt; &#x32;</title><link>https://archlinux.org/news/action/</link><pubDate>today</pubDate></item></rss>";

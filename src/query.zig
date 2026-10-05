@@ -11,24 +11,39 @@ pub fn search(db: *alpm.Alpm, o: cli.Options) ![]Match {
     const term = try std.mem.join(u.a, " ", o.names);
     var matches: std.ArrayList(Match) = .empty;
     if (o.scope != .aur) {
-        if (!o.quiet) ui.title("Repository packages · updated date is build date");
+        if (!o.quiet) ui.title(try std.fmt.allocPrint(u.a, "Repository results for {s}", .{term}));
         const packages = try repositorySearch(db, term, false);
         for (packages) |p| {
-            if (o.quiet) ui.print("{s}\n", .{ui.safe(alpm.name(p))}) else alpm.show(p);
+            if (o.quiet) ui.print("{s}\n", .{ui.safe(alpm.name(p))}) else {
+                alpm.showSearch(p, if (o.command == .select) matches.items.len + 1 else null, try installedVersion(db, alpm.name(p)));
+            }
             try matches.append(u.a, .{ .name = alpm.name(p), .source = .repo });
         }
+        if (packages.len == 0 and !o.quiet) ui.note(.muted, "No repository matches. Try a broader search term.");
     }
     if (o.scope != .repo) {
-        if (!o.quiet) ui.title("AUR packages · updated date is last modification");
+        if (!o.quiet) ui.title(try std.fmt.allocPrint(u.a, "AUR results for {s}", .{term}));
         const packages = try aur.search(term, o.search_by);
         std.mem.sort(aur.Package, packages, o.sort_by, sortAur);
         for (packages) |p| {
-            if (o.quiet) ui.print("{s}\n", .{p.Name}) else p.show();
+            if (o.quiet) ui.print("{s}\n", .{p.Name}) else {
+                p.showSearch(if (o.command == .select) matches.items.len + 1 else null, try installedVersion(db, p.Name));
+            }
             try matches.append(u.a, .{ .name = p.Name, .source = .aur });
         }
-        if (packages.len == 0 and !o.quiet) ui.print("No AUR matches.\n", .{});
+        if (packages.len == 0 and !o.quiet) ui.note(.muted, "No AUR matches. Try a broader search term.");
+    }
+    if (matches.items.len > 0 and !o.quiet) {
+        ui.print("\n", .{});
+        ui.text(try std.fmt.allocPrint(u.a, "{d} package{s} found", .{ matches.items.len, if (matches.items.len == 1) @as([]const u8, "") else "s" }), 2, .muted);
+        if (o.command == .search) ui.text("Use zap info <name> for details or zap select <term> to install.", 2, .muted);
     }
     return matches.toOwnedSlice(u.a);
+}
+// A dependency provider is not necessarily the package shown in search results.
+fn installedVersion(db: *alpm.Alpm, name: []const u8) !?[]const u8 {
+    const p = c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(name)).ptr) orelse return null;
+    return alpm.version(p);
 }
 fn sortAur(field: []const u8, a: aur.Package, b: aur.Package) bool {
     if (std.mem.eql(u8, field, "votes") and a.NumVotes != b.NumVotes) return a.NumVotes > b.NumVotes;
@@ -85,9 +100,16 @@ pub fn exactLocal(db: *alpm.Alpm, name: []const u8) !alpm.Pkg {
     return c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(name)).ptr) orelse error.PackageNotInstalled;
 }
 pub fn details(p: alpm.Pkg, local: bool) !void {
-    if (local) ui.package(alpm.name(p), alpm.version(p), "installed · build date", c.alpm_pkg_get_builddate(p), u.str(c.alpm_pkg_get_desc(p))) else alpm.show(p);
-    ui.print("  Installed size: {d} MiB\n  URL: {s}\n  Architecture: {s}\n  Packager: {s}\n", .{ @divTrunc(c.alpm_pkg_get_isize(p), 1024 * 1024), ui.safe(u.str(c.alpm_pkg_get_url(p))), ui.safe(u.str(c.alpm_pkg_get_arch(p))), ui.safe(u.str(c.alpm_pkg_get_packager(p))) });
-    if (local) ui.print("  Installed: {s}\n  Reason: {s}\n", .{ ui.date(c.alpm_pkg_get_installdate(p)), if (c.alpm_pkg_get_reason(p) == c.ALPM_PKG_REASON_EXPLICIT) "explicit" else "dependency" });
+    if (local) ui.package(alpm.name(p), alpm.version(p), "installed", "Build date", c.alpm_pkg_get_builddate(p), u.str(c.alpm_pkg_get_desc(p)), null) else alpm.show(p);
+    ui.print("\n", .{});
+    ui.field("Installed size", try std.fmt.allocPrint(u.a, "{d:.1} MiB", .{@as(f64, @floatFromInt(c.alpm_pkg_get_isize(p))) / (1024 * 1024)}));
+    ui.field("URL", u.str(c.alpm_pkg_get_url(p)));
+    ui.field("Architecture", u.str(c.alpm_pkg_get_arch(p)));
+    ui.field("Packager", u.str(c.alpm_pkg_get_packager(p)));
+    if (local) {
+        ui.field("Installed", ui.date(c.alpm_pkg_get_installdate(p)));
+        ui.field("Reason", if (c.alpm_pkg_get_reason(p) == c.ALPM_PKG_REASON_EXPLICIT) "explicit" else "dependency");
+    }
     dependencies(c.alpm_pkg_get_depends(p), "Dependencies");
     dependencies(c.alpm_pkg_get_optdepends(p), "Optional dependencies");
     dependencies(c.alpm_pkg_get_provides(p), "Provides");
@@ -102,6 +124,7 @@ pub fn details(p: alpm.Pkg, local: bool) !void {
         defer freeStrings(optional);
         strings(optional, "Optional for");
     }
+    ui.print("\n", .{});
 }
 fn freeStrings(list: [*c]c.alpm_list_t) void {
     var it = list;
@@ -109,21 +132,26 @@ fn freeStrings(list: [*c]c.alpm_list_t) void {
     c.alpm_list_free(list);
 }
 fn strings(list: [*c]c.alpm_list_t, label: []const u8) void {
-    ui.print("  {s}:", .{label});
+    var values: std.ArrayList([]const u8) = .empty;
+    defer values.deinit(u.a);
     var it = list;
-    while (it != null) : (it = it.*.next) ui.print(" {s}", .{ui.safe(u.str(@ptrCast(it.*.data)))});
-    ui.print("\n", .{});
+    while (it != null) : (it = it.*.next) values.append(u.a, u.str(@ptrCast(it.*.data))) catch return;
+    const joined = std.mem.join(u.a, "  ", values.items) catch return;
+    defer u.a.free(joined);
+    ui.field(label, joined);
 }
 pub fn dependencies(list: [*c]c.alpm_list_t, label: []const u8) void {
-    ui.print("  {s}:", .{label});
+    var values: std.ArrayList(u8) = .empty;
+    defer values.deinit(u.a);
     var it = list;
     while (it != null) : (it = it.*.next) {
         const dep: *c.alpm_depend_t = @ptrCast(@alignCast(it.*.data.?));
         const value = c.alpm_dep_compute_string(dep);
         defer c.free(value);
-        ui.print(" {s}", .{ui.safe(u.str(value))});
+        if (values.items.len > 0) values.appendSlice(u.a, "  ") catch return;
+        values.appendSlice(u.a, u.str(value)) catch return;
     }
-    ui.print("\n", .{});
+    ui.field(label, values.items);
 }
 pub fn validFile(path: []const u8) bool {
     if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
@@ -222,10 +250,24 @@ pub fn stats(db: *alpm.Alpm) !void {
     }
     const orphans = try db.orphans();
     ui.title("Installed package statistics");
-    ui.print("Packages: {d}\nExplicit: {d}\nDependencies: {d}\nForeign: {d}\nOrphans: {d}\nInstalled size: {d} MiB\n", .{ total, explicit, total - explicit, foreign, orphans.items.len, @divTrunc(size, 1024 * 1024) });
+    inline for (.{ "Packages", "Explicit", "Dependencies", "Foreign", "Orphans" }, .{ total, explicit, total - explicit, foreign, orphans.items.len }) |label, count| {
+        ui.field(label, try std.fmt.allocPrint(u.a, "{d}", .{count}));
+    }
+    ui.field("Installed size", try std.fmt.allocPrint(u.a, "{d:.2} GiB", .{@as(f64, @floatFromInt(size)) / (1024 * 1024 * 1024)}));
     std.mem.sort(alpm.Pkg, packages.items, {}, larger);
-    ui.print("\nLargest packages:\n", .{});
-    for (packages.items[0..@min(10, packages.items.len)]) |p| ui.print("  {s} {d} MiB\n", .{ ui.safe(alpm.name(p)), @divTrunc(c.alpm_pkg_get_isize(p), 1024 * 1024) });
+    ui.title("Largest packages");
+    const largest = if (packages.items.len > 0) c.alpm_pkg_get_isize(packages.items[0]) else 0;
+    for (packages.items[0..@min(10, packages.items.len)], 1..) |p, rank| {
+        ui.text(try std.fmt.allocPrint(u.a, "{d: >2}. {s}", .{ rank, alpm.name(p) }), 2, .bold);
+        const bar_width = @min(ui.columns() -| 20, 28);
+        const filled = if (largest > 0) @as(usize, @intCast(@divTrunc(@as(i128, @max(c.alpm_pkg_get_isize(p), 0)) * @as(i128, @intCast(bar_width)), largest))) else 0;
+        ui.print("      {s}", .{ui.style(.accent)});
+        for (0..filled) |_| ui.print("━", .{});
+        ui.print("{s}", .{ui.style(.muted)});
+        for (filled..bar_width) |_| ui.print("─", .{});
+        ui.print("{s}  {d:.1} MiB\n", .{ ui.style(.reset), @as(f64, @floatFromInt(c.alpm_pkg_get_isize(p))) / (1024 * 1024) });
+    }
+    ui.print("\n", .{});
 }
 fn larger(_: void, a: alpm.Pkg, b: alpm.Pkg) bool {
     return c.alpm_pkg_get_isize(a) > c.alpm_pkg_get_isize(b);
@@ -249,6 +291,22 @@ test "AUR sort is deterministic with name tie breaks" {
     std.mem.sort(aur.Package, &packages, @as([]const u8, "votes"), sortAur);
     try std.testing.expectEqualStrings("b", packages[0].Name);
     try std.testing.expectEqualStrings("a", packages[1].Name);
+}
+
+test "installed search badges require an exact identity, not a virtual provider" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(u.a, ".");
+    const native = @import("native_tests.zig");
+    try native.installedFixture(tmp.dir, "replacement", "");
+    const desc_path = "db/local/replacement-1.0-1/desc";
+    const desc = try tmp.dir.readFileAlloc(u.a, desc_path, 4096);
+    try tmp.dir.writeFile(.{ .sub_path = desc_path, .data = try std.fmt.allocPrint(u.a, "{s}%PROVIDES%\noriginal\n\n", .{desc}) });
+    var db: alpm.Alpm = .{ .h = try native.handle(root), .cfg = .{} };
+    defer db.deinit();
+    try std.testing.expect(try db.local("original") != null);
+    try std.testing.expect(try installedVersion(&db, "original") == null);
+    try std.testing.expectEqualStrings("1.0-1", (try installedVersion(&db, "replacement")).?);
 }
 
 test "file queries tolerate empty package lists and resolve directory aliases" {

@@ -6,6 +6,8 @@ pub const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("sys/file.h");
     @cInclude("sys/utsname.h");
+    @cInclude("sys/ioctl.h");
+    @cInclude("locale.h");
     @cInclude("glob.h");
     @cInclude("fnmatch.h");
     @cInclude("stdio.h");

@@ -134,9 +134,13 @@ Bubblewrap gives each makepkg invocation a fresh temporary home, isolated proces
 
 Network access remains available for source downloads. This is filesystem/process isolation using the host toolchain, not a reproducible clean chroot or protection against kernel vulnerabilities. A fresh home means user makepkg settings, custom package destinations, and source-signing keys are unavailable by default. A source requiring an unavailable PGP key fails verification. `--no-sandbox` explicitly opts into the previous user-permission build behavior when user configuration/keys are required; source review, hash checks, and signature policy still apply. Do not bypass signature verification to get a build through.
 
-## Dates in the UI
+## Terminal UI
 
-AUR results show RPC `LastModified` as **last modified**. Repository results show the package **build date**, the available repository metadata timestamp. Local listings show the **installation date**. These are labeled separately and rendered in UTC. Missing timestamps display `unknown`. Results also flag out-of-date and unmaintained AUR packages. `NO_COLOR=1` disables styling.
+Help groups commands by workflow and includes examples. Package results use compact `repo/name version` headers with descriptions and UTC timestamps below. Installed versions and AUR vote counts appear beside the header; `select` numbers the results directly so the choices remain attached to their package details. Package information uses aligned fields, installation plans and transactions include counts, and `stats` shows relative size bars for the largest packages. Source review and build headings show progress through package bases.
+
+Text wraps to the terminal width, including long paths and dependency lists. Narrow terminals stack metadata labels above their values. The compact layout takes inspiration from Paru, with zap's own `›` section markers and `?` prompts. Colors follow the terminal palette: cyan for repositories and sections, green for versions, additions and success, yellow for notices, and red for removals and errors. `NO_COLOR=1`, `TERM=dumb`, and redirected output disable styling. `--quiet` retains plain names or file paths without headings or summaries. Confirmations still default to **No** and require an explicit `y` or `yes`.
+
+AUR results label RPC `LastModified` as **last modified**. Repository results label the package **build date**, the available repository metadata timestamp. Local listings label the **installation date**. Dates are rendered in UTC; missing timestamps display `unknown`. Out-of-date and unmaintained AUR packages have separate warning lines.
 
 ## Build and transaction flow
 

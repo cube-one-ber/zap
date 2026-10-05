@@ -53,13 +53,17 @@ pub const Builder = struct {
         for (self.requested) |name| try self.resolve(name, true, 0);
         if (self.nodes.items.len > 0) try self.resolve("base-devel", false, 0);
         ui.title("Installation plan");
-        for (self.repos.items) |target| ui.print("  repo  {s}{s}\n", .{ ui.safe(target.name), if (target.dependency) " (dependency)" else "" });
-        for (self.reason_targets.items) |target| ui.print("  Mark {s} as {s}\n", .{ ui.safe(target.name), @tagName(target.reason.?) });
+        ui.text(try std.fmt.allocPrint(u.a, "{d} repo · {d} build bases · {d} reason changes", .{ self.repos.items.len, self.order.items.len, self.reason_targets.items.len }), 2, .muted);
+        for (self.repos.items) |target| ui.packageHeader(target.name, "", "repo", null, if (target.dependency) "[dependency]" else "[requested]");
+        for (self.reason_targets.items) |target| ui.text(try std.fmt.allocPrint(u.a, "{s} → {s}", .{ target.name, @tagName(target.reason.?) }), 2, .muted);
         for (self.order.items) |idx| {
             const node = self.nodes.items[idx];
-            ui.print("  {s} {s} {s} · modified {s}\n", .{ if (node.local_source) "local" else "AUR  ", ui.safe(node.package.PackageBase), ui.safe(node.package.Version), ui.date(node.package.LastModified) });
-            for (node.wanted.items) |wanted| ui.print("        {s}{s}\n", .{ ui.safe(wanted), if (srcinfo.contains(self.explicit_names.items, wanted)) " (requested)" else " (dependency)" });
+            ui.print("\n", .{});
+            ui.package(node.package.PackageBase, node.package.Version, if (node.local_source) "local" else "aur", if (node.local_source) "" else "Last modified", node.package.LastModified, "", null);
+            for (node.wanted.items) |wanted| ui.text(try std.fmt.allocPrint(u.a, "{s} · {s}", .{ wanted, if (srcinfo.contains(self.explicit_names.items, wanted)) @as([]const u8, "requested") else "dependency" }), 4, .muted);
         }
+        ui.print("\n", .{});
+        if (self.repos.items.len == 0 and self.order.items.len == 0 and self.reason_targets.items.len == 0) ui.note(.success, "No changes needed.");
     }
     fn skipInstalled(self: *Builder, old: alpm.Pkg) !void {
         ui.print("Already installed: {s} {s}\n", .{ ui.safe(alpm.name(old)), ui.safe(alpm.version(old)) });
@@ -301,10 +305,14 @@ pub const Builder = struct {
             ui.print("Build isolation: private home, read-only system and database; source downloads can access the network.\n", .{});
         }
         // Review every package base before executing any PKGBUILD code or changing the system.
-        for (self.order.items) |idx| {
+        for (self.order.items, 1..) |idx, step| {
             const node = &self.nodes.items[idx];
-            ui.title(node.package.PackageBase);
-            ui.print("Sources modified {s} · maintainer {s}{s}\n", .{ ui.date(node.package.LastModified), ui.safe(node.package.Maintainer orelse "orphaned"), if (node.package.OutOfDate != null) " · flagged out of date" else "" });
+            ui.title(try std.fmt.allocPrint(u.a, "Review {d}/{d} · {s}", .{ step, self.order.items.len, node.package.PackageBase }));
+            if (node.local_source) ui.field("Source", "Local snapshot") else {
+                ui.field("Last modified", ui.date(node.package.LastModified));
+                ui.field("Maintainer", node.package.Maintainer orelse "unmaintained");
+            }
+            if (node.package.OutOfDate != null) ui.note(.warning, "Flagged out of date");
             node.source_digest = try sourceDigest(node.dir, true);
             const files = try git(&.{ "ls-files", "-z" }, node.dir);
             var paths = std.mem.splitScalar(u8, files, 0);
@@ -312,7 +320,7 @@ pub const Builder = struct {
                 if (path.len == 0) continue;
                 const content = try git(&.{ "show", try std.fmt.allocPrint(u.a, "HEAD:{s}", .{path}) }, node.dir);
                 // Preserve newlines for source review while filtering terminal control sequences.
-                ui.print("\n── {s} ──\n", .{ui.safe(path)});
+                ui.title(path);
                 printSource(content);
             }
             try ui.require("\nThese build files can execute arbitrary code as your user. Approve this source? [y/N] ");
@@ -335,11 +343,11 @@ pub const Builder = struct {
             try tx.escalate(.{ .operation = .install, .targets = self.repos.items, .needed = self.needed });
             try self.reload();
         }
-        for (self.order.items) |idx| {
+        for (self.order.items, 1..) |idx, step| {
             const node = self.nodes.items[idx];
             if (!node.reviewed) return error.SourceNotReviewed;
             try verifySource(node);
-            ui.title(try std.fmt.allocPrint(u.a, "Build {s}", .{node.package.PackageBase}));
+            ui.title(try std.fmt.allocPrint(u.a, "Build {d}/{d} · {s}", .{ step, self.order.items.len, node.package.PackageBase }));
             try u.run(try self.makepkgArgs(node.dir, &.{ "/usr/bin/makepkg", "--cleanbuild", "--clean", "--force", "--noconfirm" }), node.dir);
             try verifySource(node);
             const paths = try u.capture(try self.makepkgArgs(node.dir, &.{ "/usr/bin/makepkg", "--packagelist" }), node.dir, 2 * 1024 * 1024);
@@ -353,7 +361,10 @@ pub const Builder = struct {
             defer built.deinit();
             try verifySource(node);
             for (built.targets, built.versions) |target, version| {
-                ui.print("  {s} {s}\n  Archive {s}\n  SHA-256 {s}\n", .{ ui.safe(target.name), ui.safe(version), ui.safe(target.archive.?), target.sha256.? });
+                ui.text(try std.fmt.allocPrint(u.a, "{s} {s}", .{ target.name, version }), 2, .bold);
+                ui.field("Archive", target.archive.?);
+                ui.field("SHA-256", target.sha256.?);
+                ui.print("\n", .{});
             }
             for (built.targets) |*target| if (srcinfo.contains(self.explicit_names.items, target.name)) {
                 target.reason = self.reason;
@@ -414,7 +425,7 @@ pub const Builder = struct {
             if (std.mem.eql(u8, entry.name, ".lock")) continue;
             if (entry.kind == .directory) try dir.deleteTree(entry.name) else try dir.deleteFile(entry.name);
         }
-        ui.print("Build cache cleared.\n", .{});
+        ui.note(.success, "Build cache cleared.");
     }
 };
 

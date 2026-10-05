@@ -16,7 +16,15 @@ pub fn version(p: Pkg) []const u8 {
     return u.str(c.alpm_pkg_get_version(p));
 }
 pub fn show(p: Pkg) void {
-    ui.package(name(p), version(p), u.str(c.alpm_db_get_name(c.alpm_pkg_get_db(p))), c.alpm_pkg_get_builddate(p), u.str(c.alpm_pkg_get_desc(p)));
+    showSearch(p, null, null);
+}
+pub fn showSearch(p: Pkg, index: ?usize, installed: ?[]const u8) void {
+    const annotation = if (installed) |old| std.fmt.allocPrint(u.a, "[installed{s}{s}]", .{ if (std.mem.eql(u8, old, version(p))) @as([]const u8, "") else ": ", if (std.mem.eql(u8, old, version(p))) @as([]const u8, "") else ui.safe(old) }) catch return else "";
+    ui.packageHeader(name(p), version(p), u.str(c.alpm_db_get_name(c.alpm_pkg_get_db(p))), index, annotation);
+    ui.text(u.str(c.alpm_pkg_get_desc(p)), 4, .reset);
+    const stamp = std.fmt.allocPrint(u.a, "Build date {s}", .{ui.date(c.alpm_pkg_get_builddate(p))}) catch return;
+    defer u.a.free(stamp);
+    ui.text(stamp, 4, .muted);
 }
 pub const Alpm = struct {
     h: *c.alpm_handle_t,

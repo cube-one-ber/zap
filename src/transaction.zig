@@ -120,7 +120,7 @@ pub fn worker(bytes: []const u8) !void {
         try ui.require("Apply these installation reason changes? [y/N] ");
         try signals.check();
         for (request.targets) |target| try db.check(c.alpm_pkg_set_reason(c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(target.name)).ptr), installReason(target, false)));
-        ui.print("Installation reasons updated.\n", .{});
+        ui.note(.success, "Installation reasons updated.");
         return;
     }
     if (request.operation == .upgrade) try db.check(c.alpm_sync_sysupgrade(db.h, 0));
@@ -166,7 +166,7 @@ pub fn worker(bytes: []const u8) !void {
     };
     if (additions == null and removals == null) {
         if (reason_changes.items.len == 0) {
-            ui.print("Everything is up to date.\n", .{});
+            ui.note(.success, "Everything is up to date.");
             return;
         }
         ui.title("Installation reasons");
@@ -174,31 +174,42 @@ pub fn worker(bytes: []const u8) !void {
         try ui.require("Apply these installation reason changes? [y/N] ");
         try signals.check();
         for (reason_changes.items) |target| try db.check(c.alpm_pkg_set_reason(c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), (try u.z(target.name)).ptr), installReason(target, old_explicit.contains(target.name))));
-        ui.print("Installation reasons updated.\n", .{});
+        ui.note(.success, "Installation reasons updated.");
         return;
     }
     ui.title("System transaction");
     for (reason_changes.items) |target| showReason(target, old_explicit.contains(target.name));
     var size: i64 = 0;
+    var add_count: usize = 0;
+    var remove_count: usize = 0;
     var it = additions;
     while (it != null) : (it = it.*.next) {
         const p = alpm.pkg(it.*.data);
         size += c.alpm_pkg_get_isize(p);
         const old = c.alpm_db_get_pkg(c.alpm_get_localdb(db.h), c.alpm_pkg_get_name(p));
         if (old) |previous| size -= c.alpm_pkg_get_isize(previous);
-        ui.print("  + {s} {s} → {s}\n", .{ ui.safe(alpm.name(p)), if (old) |previous| ui.safe(alpm.version(previous)) else "new", ui.safe(alpm.version(p)) });
+        const action: []const u8 = if (old) |previous| blk: {
+            const cmp = c.alpm_pkg_vercmp(c.alpm_pkg_get_version(p), c.alpm_pkg_get_version(previous));
+            break :blk if (cmp > 0) "upgrade" else if (cmp < 0) "downgrade" else "reinstall";
+        } else "install";
+        ui.change(alpm.name(p), if (old) |previous| alpm.version(previous) else "new", alpm.version(p), action);
+        add_count += 1;
     }
     it = removals;
     while (it != null) : (it = it.*.next) {
         const p = alpm.pkg(it.*.data);
         size -= c.alpm_pkg_get_isize(p);
-        ui.print("  - {s} {s}\n", .{ ui.safe(alpm.name(p)), ui.safe(alpm.version(p)) });
+        ui.text(try std.fmt.allocPrint(u.a, "− {s} {s}  [remove]", .{ alpm.name(p), alpm.version(p) }), 2, .danger);
+        remove_count += 1;
         for (db.cfg.hold.items) |held| if (c.fnmatch((try u.z(held)).ptr, c.alpm_pkg_get_name(p), 0) == 0) {
             ui.print("Protected by HoldPkg: {s}\n", .{ui.safe(held)});
             return error.ProtectedPackage;
         };
     }
-    ui.print("\n  Installed size change: {d} MiB\n", .{@divTrunc(size, 1024 * 1024)});
+    ui.print("\n", .{});
+    ui.field("Add / upgrade", try std.fmt.allocPrint(u.a, "{d} packages", .{add_count}));
+    ui.field("Remove", try std.fmt.allocPrint(u.a, "{d} packages", .{remove_count}));
+    ui.field("Installed size change", try std.fmt.allocPrint(u.a, "{s}{d:.1} MiB", .{ if (size > 0) @as([]const u8, "+") else "", @as(f64, @floatFromInt(size)) / (1024 * 1024) }));
     try ui.require("\nCommit this transaction, including package scripts and hooks? [y/N] ");
     try signals.check();
     data = null;
@@ -212,7 +223,8 @@ pub fn worker(bytes: []const u8) !void {
             try db.check(c.alpm_pkg_set_reason(p, reason));
         }
     };
-    ui.print("\nTransaction complete.\n", .{});
+    ui.print("\n", .{});
+    ui.note(.success, "Transaction complete.");
 }
 pub fn flags(request: Request) c_int {
     return (if (request.needed) @as(c_int, c.ALPM_TRANS_FLAG_NEEDED) else @as(c_int, 0)) | (if (request.operation == .remove and request.recursive) @as(c_int, c.ALPM_TRANS_FLAG_RECURSE) else @as(c_int, 0)) | (if (request.nosave) @as(c_int, c.ALPM_TRANS_FLAG_NOSAVE) else @as(c_int, 0));
