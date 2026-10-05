@@ -44,15 +44,15 @@ jobs:
       - name: Set development package version
         id: version
         run: |
+          chown -R builder:builder "$GITHUB_WORKSPACE"
           base=$(sed -n 's/^pkgver=//p' packaging/PKGBUILD.in)
-          version="${base}.r$(git rev-list --count HEAD).g$(git rev-parse --short=12 HEAD)"
+          version="${base}.r$(runuser -u builder -- git rev-list --count HEAD).g$(runuser -u builder -- git rev-parse --short=12 HEAD)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "ZAP_PKGVER=$version" >> "$GITHUB_ENV"
-          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(runuser -u builder -- git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
 
       - name: Check formatting and sandbox support as a normal user
         run: |
-          chown -R builder:builder "$GITHUB_WORKSPACE"
           runuser -u builder -- zig fmt --check build.zig src
           runuser -u builder -- bwrap --unshare-all --share-net --ro-bind / / -- /usr/bin/true
 
