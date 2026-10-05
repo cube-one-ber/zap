@@ -43,6 +43,7 @@ jobs:
         run: |
           docker run --rm \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --security-opt systempaths=unconfined \
             --volume "$GITHUB_WORKSPACE:/workspace" --workdir /workspace \
             --env BUILD_UID="$(id -u)" --env ZAP_PKGVER --env SOURCE_DATE_EPOCH --env GITHUB_SHA \
             archlinux:base-devel bash .github/scripts/build-arch.sh

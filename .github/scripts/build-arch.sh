@@ -15,7 +15,8 @@ useradd -m -u "$BUILD_UID" builder
 chown -R builder:builder /workspace
 
 runuser -u builder -- zig fmt --check build.zig src
-runuser -u builder -- bwrap --unshare-all --share-net --ro-bind / / -- /usr/bin/true
+# Check fresh proc/device mounts too, as used by zap's package sandbox.
+runuser -u builder -- bwrap --unshare-all --share-net --ro-bind / / --proc /proc --dev /dev -- /usr/bin/true
 # makepkg runs build() and check() without container-root privileges.
 runuser -u builder -- bash -c './packaging/source.sh && cd packaging && ZIG=/usr/local/bin/zig makepkg --noconfirm'
 
