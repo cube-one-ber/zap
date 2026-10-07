@@ -1,4 +1,7 @@
-# AUR submission for zap
+# AUR package for zap
+
+[`zap` is published on the AUR](https://aur.archlinux.org/packages/zap), with
+Cube1ber as its submitter and maintainer.
 
 The `PKGBUILD` and `.SRCINFO` build a fixed, tested source release from GitHub.
 The package name is `zap`; unrelated `zap-git` and `zap-bin` packages conflict
