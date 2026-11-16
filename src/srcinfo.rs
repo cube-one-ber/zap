@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn srcinfo_supports_epochs_split_packages_and_architecture_specific_dependencies() {
-        let meta = Metadata::parse("pkgbase = foo\npkgver = 2.0\npkgrel = 1\nepoch = 3\nmakedepends = zig\ndepends_x86_64 = libfoo>=1\ndepends_aarch64 = wrong\npkgname = foo-cli\nprovides = foo=2.0\npkgname = foo-lib\ndepends = libc", "x86_64").unwrap();
+        let meta = Metadata::parse("pkgbase = foo\npkgver = 2.0\npkgrel = 1\nepoch = 3\nmakedepends = cargo\ndepends_x86_64 = libfoo>=1\ndepends_aarch64 = wrong\npkgname = foo-cli\nprovides = foo=2.0\npkgname = foo-lib\ndepends = libc", "x86_64").unwrap();
         assert_eq!("3:2.0-1", meta.version);
         assert_eq!(2, meta.names.len());
         assert!(contains(&meta.deps, "libfoo>=1"));

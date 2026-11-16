@@ -80,8 +80,7 @@ paru -S zap
 ```
 
 The recipe is maintained in [`packaging/aur`](packaging/aur/README.md). It builds
-a fixed, checksum-verified release using the versioned `zig0.15` compiler
-dependency. The package conflicts with the
+a fixed, checksum-verified release. The package conflicts with the
 unrelated `zap-git` and `zap-bin` packages, which also install `/usr/bin/zap`.
 
 ## Commands
