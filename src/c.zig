@@ -8,6 +8,7 @@ pub const c = @cImport({
     @cInclude("sys/utsname.h");
     @cInclude("sys/ioctl.h");
     @cInclude("locale.h");
+    @cInclude("langinfo.h");
     @cInclude("glob.h");
     @cInclude("fnmatch.h");
     @cInclude("stdio.h");

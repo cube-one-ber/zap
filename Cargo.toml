@@ -1,0 +1,47 @@
+[package]
+name = "zap"
+# Base release version. Packaging sets ZAP_VERSION for development builds;
+# packaging/source.sh checks that this matches packaging/PKGBUILD.in.
+version = "0.2.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "A native Arch Linux and AUR helper"
+publish = false
+
+[[bin]]
+name = "zap"
+path = "src/main.rs"
+
+# A pacman-compatible front end for running pacman's pactest suite against
+# the engine; see src/pactest.rs.
+[[bin]]
+name = "zap-pactest"
+path = "src/pactest.rs"
+required-features = ["pactest"]
+# The engine's tests already run as part of the zap binary.
+test = false
+
+[features]
+pactest = []
+
+[dependencies]
+base64 = "0.22"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+libc = "0.2"
+liblzma = "0.4"
+lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
+bzip2 = "0.5"
+md-5 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false, features = ["xattr"] }
+ureq = { version = "2", default-features = false, features = ["tls", "native-certs"] }
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"

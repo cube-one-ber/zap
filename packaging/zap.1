@@ -1,6 +1,6 @@
-.TH ZAP 1 "October 2026" "zap 0.1.0" "User Commands"
+.TH ZAP 1 "November 2026" "zap 0.2.0" "User Commands"
 .SH NAME
-zap \- native Zig AUR helper using libalpm and systemd run0
+zap \- native Zig AUR helper using libalpm with run0 or sudo
 .SH SYNOPSIS
 .B zap
 .I command
@@ -9,7 +9,8 @@ zap \- native Zig AUR helper using libalpm and systemd run0
 .SH DESCRIPTION
 zap searches repository and AUR packages, resolves dependencies, reviews
 PKGBUILDs, builds packages as the invoking user, and runs native libalpm
-transactions through systemd run0 and polkit. It never builds as root.
+transactions as root through systemd run0 and polkit, or sudo. It never
+builds as root.
 System changes require an installed root-owned /usr/bin/zap and a terminal.
 .SH COMMANDS
 .TP
@@ -38,7 +39,7 @@ Check cached repositories and live AUR for newer versions.
 .B list [PACKAGES] (-Q)
 List installed versions, installation dates and reasons.
 .TP
-.B foreign (-Qm)
+.B foreign [PACKAGES] (-Qm)
 List installed packages absent from repositories.
 .TP
 .B remove PACKAGES (-R)
@@ -53,11 +54,16 @@ Review and remove orphan dependencies.
 .B clean [BASES] (-Sc)
 Confirm and clear all or selected package-base directories in the user's AUR source/build cache.
 .TP
+.B help [COMMAND] (-h)
+Show the command overview, or the usage, accepted options and examples of
+one command. Every command also accepts --help.
+.TP
 .B version (--version)
-Display the version and libalpm ABI.
+Display the zap, libalpm and Zig versions.
 .TP
 .B select TERM
 Search and choose numbered packages or ranges for reviewed installation.
+Results are printed with number 1 last, next to the prompt.
 .TP
 .B local-search TERM (-Qs), localinfo PACKAGES (-Qi)
 Search installed packages or display installed metadata and reverse dependencies.
@@ -80,7 +86,8 @@ List installed file paths or find their installed owners.
 .TP
 .B check [PACKAGES] (-Qk)
 Check installed file presence. Return failure if files are missing.
-This is not content/checksum verification.
+This is not content/checksum verification. Files in directories the invoking
+user cannot read are counted and reported, not treated as missing.
 .TP
 .B reason PACKAGES --asdeps|--asexplicit (-D)
 Confirm and change installation reasons under the ALPM lock.
@@ -150,11 +157,35 @@ makedepends, checkdepends or optdepends. Repository search remains unchanged.
 .B --sortby FIELD
 AUR search order: votes (default), popularity, name or modified.
 .TP
+.B --color WHEN
+Style output: auto (default), always or never. auto styles terminals only
+and honors NO_COLOR and TERM=dumb. Under run0, disabled styling also
+applies to the root worker.
+.TP
+.B --help, -h
+Show help for the command instead of running it.
+.TP
+.B --elevate TOOL
+Gain root for system changes with run0 or sudo. Without it, ZAP_ELEVATE
+decides, and otherwise run0 is used when systemd is the running service
+manager and polkit is installed, sudo when it is not. Only the fixed
+/usr/bin/zap worker is ever elevated, and only through a root-owned tool.
+.TP
 .B --
 End option parsing; remaining arguments are targets, including filenames.
+.PP
+Options that take a value accept both --sortby name and --sortby=name. An
+option that does not apply to the command is an error, never ignored.
+.SH OUTPUT
+Results go to standard output; failures go to standard error, as a message
+followed by a suggestion. Output to a pipe has no styling or
+cursor control. --quiet prints bare names or paths for scripts. In a locale
+without UTF-8, and on the Linux console, glyphs fall back to ASCII. Text from
+packages and remote services is filtered for terminal control sequences.
 .SH DATES
-All dates are UTC. AUR results show last modification. Repository results
-show build dates. Local listings show installation dates.
+All dates are UTC calendar dates, some followed by an approximate age. AUR
+results show last modification. Repository results show build dates. Local
+listings show installation dates.
 .SH SECURITY
 PKGBUILDs execute arbitrary code after review. Default sandboxing limits host
 access; --no-sandbox grants code the invoking user's permissions. The sandbox
@@ -175,15 +206,25 @@ User-owned AUR source and build cache.
 Root-owned executable used by the transaction worker.
 .SH ENVIRONMENT
 .TP
+.B ZAP_ELEVATE
+run0 or sudo: the default for --elevate. zap passes NO_COLOR to the worker
+only through run0; under sudo the worker styles output by its terminal.
+.TP
 .B NO_COLOR
-Disable terminal styling.
+Any non-empty value disables terminal styling unless --color=always is given.
+.TP
+.B COLUMNS
+Width used for wrapping when standard output is not a terminal (20 to 120).
 .TP
 .B XDG_CACHE_HOME
 Absolute user cache directory.
 .SH EXIT STATUS
-0 on success, 1 on failure, 130 on a cancelled operation.
+0 on success; 1 when the operation fails, or when owns or check finds an
+unowned or missing file; 2 when the command line is invalid; 130 on a
+cancelled operation.
 .SH SEE ALSO
 .BR pacman.conf (5),
 .BR makepkg (8),
 .BR run0 (1),
+.BR sudo (8),
 .BR libalpm (3)

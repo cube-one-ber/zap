@@ -1,0 +1,27 @@
+list
+list -q
+list pacman bash
+list nonexistent
+foreign
+foreign -q
+search linux --repo
+search linux --repo -q
+search 'zzzqqq' --repo
+search '[' --repo
+local-search linux
+local-search linux -q
+info pacman
+info sh --repo
+info nonexistent-pkg --repo
+localinfo pacman
+localinfo glibc
+localinfo bash pacman
+files pacman
+files pacman -q
+owns /usr/bin/ls
+owns /bin/ls /etc/passwd /nonexistent /usr/bin
+owns -q /usr/bin/ls
+check pacman
+check pacman bash
+stats
+orphans

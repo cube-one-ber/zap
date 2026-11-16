@@ -19,9 +19,10 @@ _zap() {
     '--quiet[Print names only]' \
     '--searchby[AUR search field]:field:(name name-desc maintainer provides depends makedepends checkdepends optdepends)' \
     '--sortby[AUR result order]:field:(votes popularity name modified)' \
-    '--help[Show help]' \
-    '--version[Show version]' \
-    '1:command:(search select info localinfo install install-files build build-local install-local get pkgbuild upgrade updates list foreign local-search files owns check reason remove orphans autoremove clean stats news help version)' \
+    '--elevate[Gain root with run0 or sudo]:tool:(run0 sudo)' \
+    '--color[Style output]:when:(auto always never)' \
+    '--help[Show help for the command]' \
+    '1:command:(search select info localinfo install install-files build build-local install-local get pkgbuild upgrade updates list foreign local-search files owns check reason remove orphans autoremove clean stats news help version --version)' \
     '*:target:->targets'
   if [[ $state == targets ]]; then
     case $line[1] in
@@ -31,6 +32,10 @@ _zap() {
         _describe 'installed package' packages ;;
       build-local|install-local|-B|-Bi) _files -/ ;;
       install-files|-U|owns|-Qo) _files ;;
+      help)
+        local -a topics
+        topics=(search select info localinfo install install-files build build-local install-local get pkgbuild upgrade updates list foreign local-search files owns check reason remove orphans autoremove clean stats news version)
+        _describe 'command' topics ;;
     esac
   fi
 }
