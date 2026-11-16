@@ -1,7 +1,7 @@
 _zap() {
     local current=${COMP_WORDS[COMP_CWORD]} command=${COMP_WORDS[1]}
     local commands='search select info localinfo install install-files build build-local install-local get pkgbuild upgrade updates list foreign local-search files owns check reason remove orphans autoremove clean stats news help version'
-    local options='--dry-run --devel --recursive --nosave --aur --repo --needed --asdeps --asexplicit --sandbox --no-sandbox --rebuildtree --cleanafter --quiet --searchby --sortby --elevate --color --help'
+    local options='--dry-run --devel --recursive --nosave --aur --repo --needed --asdeps --asexplicit --sandbox --no-sandbox --rebuildtree --cleanafter --quiet --searchby --sortby --elevate --noconfirm --color --help'
     if (( COMP_CWORD == 1 )); then
         mapfile -t COMPREPLY < <(compgen -W "$commands --help --version" -- "$current")
     elif [[ ${COMP_WORDS[COMP_CWORD-1]} == --sortby ]]; then

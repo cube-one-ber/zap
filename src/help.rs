@@ -78,7 +78,7 @@ fn overview() {
 
     ui::blank();
     ui::note(NoteKind::Info, "zap help <command> shows one command's usage, options and examples.");
-    ui::note(NoteKind::Info, "Build files run as your user only after you review them; system changes go through run0 or sudo and need a final confirmation.");
+    ui::note(NoteKind::Info, "Build files run as your user only after you review them; system changes go through run0 or sudo and need a final confirmation, unless you pass --noconfirm.");
     ui::blank();
 }
 

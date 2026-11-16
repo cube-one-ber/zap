@@ -171,6 +171,17 @@ decides, and otherwise run0 is used when systemd is the running service
 manager and polkit is installed, sudo when it is not. Only the fixed
 /usr/bin/zap worker is ever elevated, and only through a root-owned tool.
 .TP
+.B --noconfirm
+Run install, install-local, install-files or upgrade unattended. Build files
+are approved without being shown (still sandboxed and hash-checked), an AUR
+provider choice takes the most-voted provider, the final transaction is
+committed without a prompt, and engine questions get pacman's --noconfirm
+answers: replacements, IgnorePkg targets and key imports yes, conflicting
+removals no, the first provider. No terminal is needed. Root is still
+authorized by run0 or sudo: without a terminal, run0 asks through the
+desktop's polkit agent, and sudo needs a rule that requires no password.
+The approval point for later reviews is not advanced.
+.TP
 .B --
 End option parsing; remaining arguments are targets, including filenames.
 .PP
@@ -190,7 +201,7 @@ listings show installation dates.
 PKGBUILDs execute arbitrary code after review. Default sandboxing limits host
 access; --no-sandbox grants code the invoking user's permissions. The sandbox
 uses the host toolchain and is not a clean chroot or network isolation. Every system transaction requires a separate final
-confirmation and uses configured signature policies, ALPM locks and hooks.
+confirmation, unless --noconfirm approves it and the build files unseen, and uses configured signature policies, ALPM locks and hooks.
 Approved archives are copied into private root-owned staging and checked
 against their SHA-256 digests before installation. AUR upgrades span several
 transactions; earlier successful installs remain if a later build fails.

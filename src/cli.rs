@@ -84,6 +84,8 @@ pub struct Options {
     pub sort_by: SortBy,
     pub color: ColorMode,
     pub elevate: Option<Elevator>,
+    /// Unattended: approve every prompt the way --noconfirm documents.
+    pub noconfirm: bool,
 }
 
 impl Options {
@@ -107,6 +109,7 @@ impl Options {
             sort_by: SortBy::Votes,
             color: ColorMode::Auto,
             elevate: None,
+            noconfirm: false,
         }
     }
 }
@@ -387,6 +390,7 @@ pub enum Flag {
     Sortby,
     Quiet,
     Elevate,
+    Noconfirm,
     Color,
     Help,
 }
@@ -404,7 +408,7 @@ const fn o(flag: Flag, long: &'static str, summary: &'static str, commands: Comm
     OptionSpec { flag, long, short: "", value: "", summary, commands }
 }
 
-pub static OPTIONS: [OptionSpec; 19] = [
+pub static OPTIONS: [OptionSpec; 20] = [
     o(Flag::DryRun, "--dry-run", "Show the plan without building, elevating or changing the system", BUILDS.union(CommandSet::of(&[C::InstallFiles, C::Remove, C::Autoremove, C::Clean, C::Reason]))),
     o(Flag::Needed, "--needed", "Skip targets that are already installed and current", CommandSet::of(&[C::Install, C::InstallFiles, C::Select])),
     o(Flag::Asdeps, "--asdeps", "Mark the requested packages as dependencies", CommandSet::of(&[C::Install, C::InstallFiles, C::InstallLocal, C::Select, C::Reason])),
@@ -422,6 +426,7 @@ pub static OPTIONS: [OptionSpec; 19] = [
     OptionSpec { value: "ORDER", ..o(Flag::Sortby, "--sortby", "AUR result order: votes (default), popularity, name, modified", SEARCHES) },
     OptionSpec { short: "-q", ..o(Flag::Quiet, "--quiet", "Print bare names (paths for files), one per line", CommandSet::of(&[C::Search, C::LocalSearch, C::Updates, C::List, C::Foreign, C::Orphans, C::Files, C::Owns])) },
     OptionSpec { value: "TOOL", ..o(Flag::Elevate, "--elevate", "Gain root with run0 or sudo; default $ZAP_ELEVATE, else run0 with systemd and polkit, else sudo", ELEVATING) },
+    o(Flag::Noconfirm, "--noconfirm", "Run unattended: approve build files and the transaction without asking; root still needs run0 or sudo to authorize", CommandSet::of(&[C::Install, C::Upgrade, C::InstallLocal, C::InstallFiles])),
     OptionSpec { value: "WHEN", ..o(Flag::Color, "--color", "Style output: auto (default), always or never", EVERY) },
     OptionSpec { short: "-h", ..o(Flag::Help, "--help", "Show help for the command", EVERY) },
 ];
@@ -534,6 +539,7 @@ fn apply(o: &mut Options, flag: Flag, value: &str) -> Result<()> {
         Flag::Recursive => o.recursive = true,
         Flag::Nosave => o.nosave = true,
         Flag::Quiet => o.quiet = true,
+        Flag::Noconfirm => o.noconfirm = true,
         Flag::Rebuildtree => o.rebuild_tree = true,
         Flag::Cleanafter => o.clean_after = true,
         Flag::Sandbox | Flag::NoSandbox => {
@@ -694,7 +700,9 @@ mod tests {
         assert_eq!(Kind::ConflictingOptions, kind(parse(&["install", "foo", "--needed", "--rebuildtree"])));
         assert_eq!(C::InstallLocal, parse(&["-Bi", ".", "--sandbox"]).unwrap().command);
         assert_eq!(Kind::OptionValueRequired, kind(parse(&["search", "foo", "--sortby"])));
-        assert_eq!(Kind::UnknownOption, kind(parse(&["install", "foo", "--noconfirm"])));
+        assert!(parse(&["upgrade", "--noconfirm"]).unwrap().noconfirm);
+        assert_eq!(Kind::OptionNotValidForCommand, kind(parse(&["remove", "foo", "--noconfirm"])));
+        assert_eq!(Kind::OptionNotValidForCommand, kind(parse(&["select", "foo", "--noconfirm"])));
         assert_eq!(Kind::InvalidSearchField, kind(parse(&["search", "foo", "--searchby", "name&arg=evil"])));
         assert_eq!("-archive.pkg.tar", parse(&["-U", "--", "-archive.pkg.tar"]).unwrap().names[0]);
     }

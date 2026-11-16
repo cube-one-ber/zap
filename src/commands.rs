@@ -11,6 +11,7 @@ use crate::{aur, help, news, query, util};
 
 pub fn run(o: Options) -> Result<()> {
     ui::set_color_mode(o.color);
+    ui::set_unattended(o.noconfirm);
     if o.command == Command::Help {
         help::show(o.topic);
         return Ok(());

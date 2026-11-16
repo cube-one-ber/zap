@@ -120,7 +120,7 @@ Every command also accepts `--help`: `zap install --help` is `zap help install`.
 
 `--dry-run` skips builds, privilege escalation, and system changes for install, select, install-files, build, build-local, install-local, upgrade, remove, reason, autoremove, and clean. Installation/build plans may fetch or update the user cache and ask for a provider choice. Repository dependencies and conflicts are finalized by the engine in the privileged transaction; dry-run is a build/dependency plan, not a simulation of committing the transaction. `get` and `pkgbuild` fetch sources and reject `--dry-run`.
 
-`updates --devel` and `upgrade --devel` include installed `-git`, `-svn`, `-hg`, `-bzr`, `-cvs`, `-darcs`, and `-fossil` packages for rebuild. Ordinary upgrades preserve existing installation reasons. `remove --recursive` also removes unneeded dependencies. `remove --nosave` discards backup configuration files; `-Rns` combines both options. Plain removal retains the usual ALPM backup behavior. There is no unattended transaction confirmation flag.
+`updates --devel` and `upgrade --devel` include installed `-git`, `-svn`, `-hg`, `-bzr`, `-cvs`, `-darcs`, and `-fossil` packages for rebuild. Ordinary upgrades preserve existing installation reasons. `remove --recursive` also removes unneeded dependencies. `remove --nosave` discards backup configuration files; `-Rns` combines both options. Plain removal retains the usual ALPM backup behavior. `--noconfirm` runs installs and upgrades unattended; see [Unattended installs and upgrades](#unattended-installs-and-upgrades).
 
 ```sh
 zap info google-chrome
@@ -168,7 +168,30 @@ zap files bash --quiet
 zap news
 ```
 
-No arguments display help; unknown commands/options fail and suggest the nearest spelling. Options that take a value accept `--sortby name` and `--sortby=name`. `--` ends option parsing for filenames. Flags that do not apply to a command fail explicitly. zap deliberately omits arbitrary makepkg/privilege command flags, checksum/PGP bypasses, unattended confirmation, automatic PGP trust, executable user hooks/configuration, broad overwrite switches, and automatic cycle bootstrapping. Custom PKGBUILD repositories, repository source downloads, AUR comment scraping, persistent VCS commit tracking, and local-repository/chroot management are outside this implementation.
+No arguments display help; unknown commands/options fail and suggest the nearest spelling. Options that take a value accept `--sortby name` and `--sortby=name`. `--` ends option parsing for filenames. Flags that do not apply to a command fail explicitly. zap deliberately omits arbitrary makepkg/privilege command flags, checksum/PGP bypasses, automatic PGP trust, executable user hooks/configuration, broad overwrite switches, and automatic cycle bootstrapping. Custom PKGBUILD repositories, repository source downloads, AUR comment scraping, persistent VCS commit tracking, and local-repository/chroot management are outside this implementation.
+
+## Unattended installs and upgrades
+
+`--noconfirm` lets `install`, `install-local`, `install-files` and `upgrade` run with nobody at the keyboard, for example from a script or a timer:
+
+```sh
+zap upgrade --noconfirm
+```
+
+| Prompt | Answer under `--noconfirm` |
+| --- | --- |
+| Review of AUR or local build files | Approved without being shown; still sandboxed and checked against the fetched sources |
+| AUR provider | The most-voted provider |
+| Final transaction and installation reasons | Committed |
+| Replacement, IgnorePkg target, signing-key import | Yes, as pacman `--noconfirm` |
+| Removing a conflicting installed package | No: the transaction fails instead |
+| Repository provider | The first one listed |
+
+Each answer is printed next to its question, so a log of the run records what was decided. No terminal is required.
+
+Getting root is not unattended: run0 or sudo still authorizes every system change. With no terminal, run0 asks polkit, which shows the desktop's authentication dialog (on Omarchy, the shell's on-screen password prompt). Under sudo, a run without a terminal needs a sudoers rule that does not ask for a password. An AUR upgrade can involve several transactions, and each one is authorized separately.
+
+Build files approved this way do not count as reviewed: the next interactive review shows every change since the last time *you* approved that package base.
 
 ## Build isolation
 
@@ -198,7 +221,7 @@ Failures are reported on standard error as one line saying what failed and for w
 | 2 | The command line was wrong |
 | 130 | Cancelled at a prompt or by a signal |
 
-Color follows the terminal palette: cyan for repositories and headings, magenta for the AUR, green for versions and success, yellow for notices, red for removals and errors. `--color=auto|always|never` selects styling; in `auto`, a non-empty `NO_COLOR`, `TERM=dumb` and redirected output disable it, and under run0 disabled styling also applies to the root worker. In a locale without UTF-8, and on the Linux console, glyphs fall back to ASCII. Styled output links package names in search results and details to their AUR or archlinux.org page, and package details mark installed optional dependencies. Output to a pipe contains no styling or cursor control, and bulk listings are written in batches. `--quiet` prints bare names or file paths with no headings or summaries, for scripts. Remote and package-supplied text is filtered before display: control characters, including 8-bit C1 controls, are blanked, and bidirectional overrides are shown as a replacement character so reviewed sources cannot display misleadingly. Confirmations default to **No** and require an explicit `y` or `yes`.
+Color follows the terminal palette: cyan for repositories and headings, magenta for the AUR, green for versions and success, yellow for notices, red for removals and errors. `--color=auto|always|never` selects styling; in `auto`, a non-empty `NO_COLOR`, `TERM=dumb` and redirected output disable it, and under run0 disabled styling also applies to the root worker. In a locale without UTF-8, and on the Linux console, glyphs fall back to ASCII. Styled output links package names in search results and details to their AUR or archlinux.org page, and package details mark installed optional dependencies. Output to a pipe contains no styling or cursor control, and bulk listings are written in batches. `--quiet` prints bare names or file paths with no headings or summaries, for scripts. Remote and package-supplied text is filtered before display: control characters, including 8-bit C1 controls, are blanked, and bidirectional overrides are shown as a replacement character so reviewed sources cannot display misleadingly. Confirmations default to **No** and require an explicit `y` or `yes`, except under `--noconfirm`, which prints each question with the answer it gave.
 
 Dates are UTC calendar dates, with an approximate age where it helps (`2026-07-16 · 4 months ago`); a missing timestamp shows `unknown`. AUR dates are the RPC `LastModified`; repository dates are build dates; local listings show installation dates.
 
@@ -237,6 +260,6 @@ The cache is `$XDG_CACHE_HOME/zap` or `$HOME/.cache/zap`, restricted to its owne
 
 PKGBUILDs are programs. Default build isolation limits their host access; with `--no-sandbox`, approved code has the permissions of your user. Source review and hash checks alone do not sandbox code. Installed packages, package scriptlets, and hooks can change the system as root after you approve the final transaction. The implementation has not received an independent security audit. Signed-package requirements are never disabled to make an AUR installation succeed; if your LocalFileSigLevel requires signatures, provide appropriately signed build artifacts.
 
-Deliberate limits include no automatic cycle bootstrapping, no edits to tracked source files, no symlinked tracked source files, no automatic PGP trust for makepkg sources, no broad file-overwrite switch, and no unattended privileged transactions. Unsupported or inconsistent build metadata fails explicitly.
+Deliberate limits include no automatic cycle bootstrapping, no edits to tracked source files, no symlinked tracked source files, no automatic PGP trust for makepkg sources, and no broad file-overwrite switch. `--noconfirm` approves build files without showing them; it does not relax the sandbox, hash or signature checks, and root still has to be authorized each time. Unsupported or inconsistent build metadata fails explicitly.
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

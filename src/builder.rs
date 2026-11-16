@@ -747,6 +747,10 @@ fn choose_aur(dep: &str) -> Result<Package> {
             ..ui::Entry::default()
         });
     }
+    if ui::unattended() {
+        ui::assumed("Provider number:", "1");
+        return Ok(providers.swap_remove(0));
+    }
     let reply = ui::answer("Provider number:")?;
     match reply.parse::<usize>() {
         Ok(choice) if (1..=providers.len()).contains(&choice) => Ok(providers.swap_remove(choice - 1)),
@@ -828,6 +832,14 @@ fn review(node: &mut Node, step: usize, total: usize) -> Result<()> {
         }
     }
     node.source_digest = Some(source_digest(&node.dir, true)?);
+    if ui::unattended() {
+        // Approved without being shown. The approved ref stays where a person
+        // last approved, so the next interactive review shows everything since.
+        ui::assumed(&format!("Approve {} without review?", node.package.PackageBase), "yes");
+        verify_source(node)?;
+        node.reviewed = true;
+        return Ok(());
+    }
     let files = git(&["ls-files", "-z"], Some(&node.dir))?;
     for path in files.split(|&b| b == 0).filter(|p| !p.is_empty()) {
         let path = String::from_utf8_lossy(path);
@@ -1053,6 +1065,29 @@ mod tests {
         assert_eq!(old, normalize_pkgver(b"pkgver='2.0.r4'\nbuild() { echo ok; }"));
         assert_ne!(old, normalize_pkgver(b"pkgver=2.0;evil\nbuild() { echo ok; }"));
         assert_ne!(old, normalize_pkgver(b"pkgver=2.0\nbuild() { echo evil; }"));
+    }
+
+    #[test]
+    fn unattended_review_approves_without_input_and_keeps_the_approved_ref() {
+        let _lock = ui::test_lock();
+        let tmp = TempDir::new();
+        let root = tmp.str();
+        std::fs::write(tmp.path().join("PKGBUILD"), "pkgname=fixture\n").unwrap();
+        std::fs::write(tmp.path().join(".SRCINFO"), "pkgbase = fixture\n").unwrap();
+        git_commit(root);
+        let package = Package { Name: "fixture".into(), PackageBase: "fixture".into(), ..Package::default() };
+        let mut node = Node::new(package, root.into(), Metadata::default());
+        // Input that would refuse, if anything read it.
+        let stdin = Stdin::replying("n\n");
+        ui::set_unattended(true);
+        ui::begin_capture();
+        let outcome = review(&mut node, 1, 1);
+        ui::end_capture();
+        ui::set_unattended(false);
+        drop(stdin);
+        outcome.unwrap();
+        assert!(node.reviewed);
+        assert_eq!("", git_line(&["for-each-ref", APPROVED_REF], root).unwrap());
     }
 
     #[test]

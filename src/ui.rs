@@ -1228,6 +1228,34 @@ fn progress_key(label: &str, name: &str, current: usize, total: usize) -> u64 {
 
 // ── Prompts ─────────────────────────────────────────────────────────────────
 
+/// Set by --noconfirm, and in the worker by the request: prompts are answered
+/// without reading input, and no terminal is required.
+static UNATTENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_unattended(on: bool) {
+    UNATTENDED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn unattended() -> bool {
+    UNATTENDED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Show a question with the reply given on the user's behalf, so an
+/// unattended log records what was decided.
+pub fn assumed(prompt: &str, reply: &str) {
+    let content = wrapped(&safe(prompt.trim_matches(|c| c == ' ' || c == '\n')), columns().saturating_sub(2), 4);
+    let mut out = Out::new();
+    out.pad(2);
+    out.paint(Tone::Warning, "?");
+    out.put(" ");
+    out.paint(Tone::Bold, &content);
+    out.put(" ");
+    out.put(reply);
+    out.put(" (--noconfirm)\n");
+    emit(out);
+    flush();
+}
+
 /// Ask a question and read one line from standard input. End of input is
 /// never treated as consent.
 pub fn answer(prompt: &str) -> Result<String> {
@@ -1291,8 +1319,12 @@ pub fn confirm(prompt: &str) -> bool {
 }
 
 /// Ask, and refuse unless the answer is yes. Input that ends first is
-/// ConfirmationRequired, as at any other prompt.
+/// ConfirmationRequired, as at any other prompt. Unattended, the answer is yes.
 pub fn require(prompt: &str) -> Result<()> {
+    if unattended() {
+        assumed(prompt, "yes");
+        return Ok(());
+    }
     if yes(&answer(prompt)?) {
         Ok(())
     } else {

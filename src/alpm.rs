@@ -235,6 +235,15 @@ fn snapshot_dir() -> Option<std::path::PathBuf> {
 
 struct Callbacks;
 
+/// A yes/no question: asked, or answered with `unattended` under --noconfirm.
+fn ask(prompt: &str, unattended: bool) -> bool {
+    if ui::unattended() {
+        ui::assumed(prompt, if unattended { "yes" } else { "no" });
+        return unattended;
+    }
+    ui::confirm(prompt)
+}
+
 fn interrupted() -> bool {
     signals::CANCELLED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -246,21 +255,23 @@ impl libalpm::Frontend for Callbacks {
         }
     }
 
-    /// Every question defaults to "no". Questions without a case here, such
-    /// as skipping unresolvable targets or deleting corrupted files, stay "no".
+    /// Every question defaults to "no". Unattended, the yes/no questions get
+    /// pacman's --noconfirm answer and a provider choice the first provider.
+    /// Questions without a case here, such as skipping unresolvable targets or
+    /// deleting corrupted files, stay "no".
     fn question(&self, q: &mut Question) {
         match q {
             Question::InstallIgnorePkg { pkg, install } => {
                 ui::note(ui::NoteKind::Warning, &format!("{} is listed in IgnorePkg.", pkg.name));
-                *install = ui::confirm("Install it anyway? [y/N]");
+                *install = ask("Install it anyway? [y/N]", true);
             }
             Question::Replace { old, new, replace, .. } => {
                 ui::note(ui::NoteKind::Warning, &format!("{} replaces {}.", new.name, old.name));
-                *replace = ui::confirm("Approve the replacement? [y/N]");
+                *replace = ask("Approve the replacement? [y/N]", true);
             }
             Question::Conflict { package1, package2, remove, .. } => {
                 ui::note(ui::NoteKind::Warning, &format!("{package1} conflicts with {package2}."));
-                *remove = ui::confirm("Remove the conflicting installed package? [y/N]");
+                *remove = ask("Remove the conflicting installed package? [y/N]", false);
             }
             Question::SelectProvider { depend, providers, use_index } => {
                 ui::heading("Choose a provider", &depend.to_string());
@@ -273,6 +284,11 @@ impl libalpm::Frontend for Callbacks {
                         ..ui::Entry::default()
                     });
                 }
+                if ui::unattended() {
+                    ui::assumed("Provider [1]:", "1");
+                    *use_index = 0;
+                    return;
+                }
                 let Ok(reply) = ui::answer("Provider [1]:") else {
                     *use_index = -1;
                     return;
@@ -282,7 +298,7 @@ impl libalpm::Frontend for Callbacks {
             }
             Question::ImportKey { fingerprint, uid, import } => {
                 ui::note(ui::NoteKind::Warning, &format!("Signing key {fingerprint} ({uid}) is not in the keyring."));
-                *import = ui::confirm("Import and trust this key for package verification? [y/N]");
+                *import = ask("Import and trust this key for package verification? [y/N]", true);
             }
             Question::CorruptedPkg { remove, .. } => *remove = false,
             Question::RemovePkgs { skip, .. } => *skip = false,

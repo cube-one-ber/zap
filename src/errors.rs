@@ -52,7 +52,7 @@ kinds! {
 
     // Environment.
     BuildsMustNotRunAsRoot => ("Run zap as your regular user", "Only the internal transaction worker runs as root, started through run0 or sudo after you approve a change.", false, false),
-    InteractiveTerminalRequired => ("An interactive terminal is required", "Every system change is confirmed at a prompt; zap has no unattended mode. Use --dry-run to preview.", false, false),
+    InteractiveTerminalRequired => ("An interactive terminal is required", "Every system change is confirmed at a prompt. Run zap from a terminal, or pass --noconfirm to install or upgrade unattended.", false, false),
     ConfirmationRequired => ("Input ended before the question was answered", "Nothing was approved. Run zap from an interactive terminal.", false, false),
     InputTooLong => ("The reply was too long", "", false, false),
     HomeNotSet => ("HOME is not set", "zap keeps its build cache under $XDG_CACHE_HOME or $HOME/.cache.", false, false),

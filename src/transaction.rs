@@ -30,13 +30,15 @@ pub enum Operation {
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub name: String,
-    #[serde(default)]
+    // Defaults are left out of the JSON so a request naming every installed
+    // package still fits in the worker's one argument (REQUEST_LIMIT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dependency: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<Reason>,
 }
 
@@ -58,17 +60,22 @@ pub struct Request {
     pub nosave: bool,
     #[serde(default)]
     pub needed: bool,
+    /// Commit without a confirmation or a terminal. `escalate` sets it from
+    /// --noconfirm; it is left out of the JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub noconfirm: bool,
 }
 
 impl Request {
     pub fn new(operation: Operation) -> Request {
-        Request { operation, targets: Vec::new(), recursive: false, nosave: false, needed: false }
+        Request { operation, targets: Vec::new(), recursive: false, nosave: false, needed: false, noconfirm: false }
     }
 }
 
 const WORKER_PATH: &str = "/usr/bin/zap";
+/// The request travels as one argument, and Linux caps a single argument at
+/// 128 KiB (MAX_ARG_STRLEN). This bound, not a target count, limits a request.
 pub const REQUEST_LIMIT: usize = 96 * 1024;
-const TARGET_LIMIT: usize = 1024;
 const ARCHIVE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const SOURCE_LIMIT: u64 = 16 * 1024 * 1024;
 
@@ -126,12 +133,12 @@ fn elevator_path(tool: Elevator) -> &'static str {
 }
 
 /// Everything a system change needs, checked before any work that would be
-/// wasted without it: the trusted worker, a trusted elevation tool, and a
-/// terminal for the confirmations. Returns the tool.
+/// wasted without it: the trusted worker, a trusted elevation tool, and,
+/// unless unattended, a terminal for the confirmations. Returns the tool.
 pub fn preflight() -> Result<Elevator> {
     trusted_executable()?;
     let tool = trusted_elevator()?;
-    if unsafe { libc::isatty(0) } == 0 {
+    if !ui::unattended() && unsafe { libc::isatty(0) } == 0 {
         return errors::fail(Kind::InteractiveTerminalRequired);
     }
     Ok(tool)
@@ -147,6 +154,7 @@ pub fn trusted_elevator() -> Result<Elevator> {
 /// Run a request in the root worker. The worker shows the final transaction
 /// and asks for confirmation itself.
 pub fn escalate(request: &Request) -> Result<()> {
+    let request = &Request { noconfirm: ui::unattended(), ..request.clone() };
     validate(request)?;
     let tool = preflight()?;
     let json = serde_json::to_string(request).map_err(|_| Kind::InvalidTransactionRequest)?;
@@ -163,7 +171,8 @@ pub fn escalate(request: &Request) -> Result<()> {
     // Ctrl-C belongs to the worker while it runs: this process stays to
     // report how the worker ended instead of returning the terminal early.
     signals::defer_interrupts();
-    let status = util::run_status(&elevated_args(tool, &json, ui::styled()), Some("/"));
+    let terminal = unsafe { libc::isatty(0) } != 0;
+    let status = util::run_status(&elevated_args(tool, &json, ui::styled(), terminal), Some("/"));
     signals::restore();
     outcome(status?)
 }
@@ -171,12 +180,15 @@ pub fn escalate(request: &Request) -> Result<()> {
 /// The worker command line for each tool. run0 starts the worker with a clean
 /// environment, so the one presentation preference is carried as a constant;
 /// sudo's environment policy may refuse that, so under sudo the worker styles
-/// output by what its terminal supports.
-fn elevated_args(tool: Elevator, json: &str, styled: bool) -> Vec<String> {
+/// output by what its terminal supports. Without a `terminal` (an unattended
+/// run), run0 pipes the worker's output and polkit asks for authentication
+/// through the desktop's agent, an on-screen dialog.
+fn elevated_args(tool: Elevator, json: &str, styled: bool, terminal: bool) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     match tool {
         Elevator::Run0 => {
-            args.extend([elevator_path(Elevator::Run0), "--pty", "--background=", "--chdir=/"].map(String::from));
+            let stdio = if terminal { "--pty" } else { "--pipe" };
+            args.extend([elevator_path(Elevator::Run0), stdio, "--background=", "--chdir=/"].map(String::from));
             if !styled {
                 args.push("--setenv=NO_COLOR=1".into());
             }
@@ -250,9 +262,6 @@ pub fn validate(request: &Request) -> Result<()> {
     if request.needed && op != Operation::Install {
         return errors::fail(Kind::InvalidTransactionFlags);
     }
-    if request.targets.len() > TARGET_LIMIT {
-        return errors::fail(Kind::TransactionTooLarge);
-    }
     for (i, target) in request.targets.iter().enumerate() {
         if target.reason.is_some() && op != Operation::Install && op != Operation::Reason {
             return errors::fail(Kind::InvalidTransactionFlags);
@@ -301,15 +310,16 @@ pub fn worker(bytes: &str) -> Result<()> {
     if unsafe { libc::geteuid() != 0 || libc::getuid() != 0 } {
         return errors::fail(Kind::RootWorkerRequired);
     }
-    if unsafe { libc::isatty(0) } == 0 {
-        return errors::fail(Kind::InteractiveTerminalRequired);
-    }
     if bytes.len() > REQUEST_LIMIT {
         return errors::fail(Kind::TransactionTooLarge);
     }
     // Unknown fields are refused: a request this worker does not fully
     // understand is never partially applied.
     let request: Request = serde_json::from_str(bytes).map_err(|_| Kind::InvalidTransactionRequest)?;
+    ui::set_unattended(request.noconfirm);
+    if !request.noconfirm && unsafe { libc::isatty(0) } == 0 {
+        return errors::fail(Kind::InteractiveTerminalRequired);
+    }
     signals::install();
     validate(&request)?;
     let mut db = Alpm::init()?;
@@ -718,10 +728,15 @@ mod tests {
         let json = "{\"operation\":\"upgrade\"}";
         assert_eq!(
             format!("/usr/bin/run0 --pty --background= --chdir=/ --setenv=NO_COLOR=1 -- /usr/bin/zap __transaction {json}"),
-            elevated_args(Elevator::Run0, json, false).join(" ")
+            elevated_args(Elevator::Run0, json, false, true).join(" ")
         );
-        assert!(!elevated_args(Elevator::Run0, json, true).join(" ").contains("NO_COLOR"));
-        assert_eq!(format!("/usr/bin/sudo -- /usr/bin/zap __transaction {json}"), elevated_args(Elevator::Sudo, json, false).join(" "));
+        assert!(!elevated_args(Elevator::Run0, json, true, true).join(" ").contains("NO_COLOR"));
+        // Unattended, with no terminal: run0 pipes, and polkit's desktop agent authenticates.
+        assert_eq!(
+            format!("/usr/bin/run0 --pipe --background= --chdir=/ -- /usr/bin/zap __transaction {json}"),
+            elevated_args(Elevator::Run0, json, true, false).join(" ")
+        );
+        assert_eq!(format!("/usr/bin/sudo -- /usr/bin/zap __transaction {json}"), elevated_args(Elevator::Sudo, json, false, true).join(" "));
         // An explicit choice wins over the environment and the system.
         set_elevator(Some(Elevator::Sudo));
         let chosen = elevator();
@@ -757,6 +772,20 @@ mod tests {
         let parsed: Request = serde_json::from_str(&json).unwrap();
         validate(&parsed).unwrap();
         assert_eq!(request, parsed);
+        // noconfirm is sent only when set.
+        let unattended = Request { noconfirm: true, ..Request::new(Operation::Upgrade) };
+        let json = serde_json::to_string(&unattended).unwrap();
+        assert_eq!("{\"operation\":\"upgrade\",\"targets\":[],\"recursive\":false,\"nosave\":false,\"needed\":false,\"noconfirm\":true}", json);
+        assert_eq!(unattended, serde_json::from_str::<Request>(&json).unwrap());
+        // Targets send only what differs from the defaults, so reinstalling a
+        // few thousand packages fits in one request.
+        assert_eq!("{\"name\":\"zlib\"}", serde_json::to_string(&Target::named("zlib")).unwrap());
+        let everything = Request {
+            targets: (0..4000).map(|i| Target::named(&format!("package{i:04}"))).collect(),
+            ..Request::new(Operation::Install)
+        };
+        validate(&everything).unwrap();
+        assert!(serde_json::to_string(&everything).unwrap().len() <= REQUEST_LIMIT);
         // Absent fields take their defaults; unknown or repeated ones are refused.
         assert_eq!(Request::new(Operation::Upgrade), serde_json::from_str("{\"operation\":\"upgrade\"}").unwrap());
         assert!(serde_json::from_str::<Request>("{\"operation\":\"upgrade\",\"force\":true}").is_err());

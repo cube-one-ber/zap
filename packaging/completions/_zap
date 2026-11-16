@@ -20,6 +20,7 @@ _zap() {
     '--searchby[AUR search field]:field:(name name-desc maintainer provides depends makedepends checkdepends optdepends)' \
     '--sortby[AUR result order]:field:(votes popularity name modified)' \
     '--elevate[Gain root with run0 or sudo]:tool:(run0 sudo)' \
+    '--noconfirm[Install or upgrade without prompts]' \
     '--color[Style output]:when:(auto always never)' \
     '--help[Show help for the command]' \
     '1:command:(search select info localinfo install install-files build build-local install-local get pkgbuild upgrade updates list foreign local-search files owns check reason remove orphans autoremove clean stats news help version --version)' \
