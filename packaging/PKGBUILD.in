@@ -3,7 +3,7 @@ pkgname=zap
 pkgver=0.2.0
 pkgrel=1
 pkgdesc='Native AUR helper with its own libalpm engine, using run0 or sudo'
-arch=('x86_64' 'aarch64')
+arch=('x86_64')
 url='https://github.com/cube-one-ber/zap'
 license=('GPL-3.0-or-later')
 # The engine reimplements libalpm, so libalpm.so is not linked; pacman
