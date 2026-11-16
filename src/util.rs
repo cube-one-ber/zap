@@ -176,8 +176,8 @@ pub fn secure_dir(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Join paths as Zig's `std.fs.path.join` does: one separator between
-/// non-empty parts, keeping a trailing one.
+/// Join paths with one separator between non-empty parts, keeping a
+/// trailing one.
 pub fn join(base: &str, rest: &str) -> String {
     match (base.is_empty(), rest.is_empty()) {
         (_, true) => base.into(),
@@ -188,8 +188,7 @@ pub fn join(base: &str, rest: &str) -> String {
     }
 }
 
-/// `path` made absolute and normalised without touching the file system,
-/// as Zig's `std.fs.path.resolve`.
+/// `path` made absolute and normalised without touching the file system.
 pub fn resolve(cwd: &str, path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     let joined = if path.starts_with('/') { path.to_string() } else { format!("{cwd}/{path}") };

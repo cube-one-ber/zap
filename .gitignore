@@ -1,5 +1,3 @@
-.zig-cache/
-zig-out/
 packaging/PKGBUILD
 packaging/zap-source.tar.gz
 packaging/src/

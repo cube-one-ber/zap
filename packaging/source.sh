@@ -15,7 +15,7 @@ fi
 archive="$project_dir/packaging/zap-source.tar.gz"
 tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
   --transform='s,^,zap/,' -C "$project_dir" -cf - \
-  --exclude='*.zig' Cargo.toml Cargo.lock build.rs src README.md LICENSE packaging/zap.1 packaging/completions |
+  Cargo.toml Cargo.lock build.rs src README.md LICENSE packaging/zap.1 packaging/completions |
   gzip -n > "$archive"
 digest=$(sha256sum -- "$archive")
 digest=${digest%% *}

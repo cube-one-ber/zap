@@ -9,7 +9,7 @@ macro_rules! commands {
         pub enum Command { $($variant,)* }
         impl Command {
             pub const ALL: &'static [Command] = &[$(Command::$variant,)*];
-            /// The identifier the Zig original used, also accepted as a spelling.
+            /// The snake_case identifier (`install_files`), also accepted as a spelling.
             pub fn tag(self) -> &'static str {
                 match self { $(Command::$variant => $tag,)* }
             }

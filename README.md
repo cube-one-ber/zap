@@ -27,7 +27,7 @@ The test suite includes AUR API fixtures, name/manifest validation, signature po
 
 Every successful push to `master` publishes a new [GitHub pre-release](https://github.com/cube-one-ber/zap/releases). The **Build, test and pre-release** workflow can also be run manually on `master`. Pull requests and other branches run the same checks and save build artifacts without publishing releases.
 
-The workflow builds an x86_64 Arch package with cargo, runs the full tests (including real sandboxed builds and pacman's pactest suite), checks that its output matches the Zig baseline build and is not slower, and uploads the main package, optional debug symbols, source archive, generated PKGBUILD, build information, and `SHA256SUMS`. The version includes the Git revision count and commit, for example `0.2.0.r5.g0123456789ab`. Each pre-release is tied to its exact commit; rerunning a published build preserves its original release assets. Pre-releases do not replace the latest stable release.
+The workflow builds an x86_64 Arch package with cargo, runs the full tests (including real sandboxed builds and pacman's pactest suite), and uploads the main package, optional debug symbols, source archive, generated PKGBUILD, build information, and `SHA256SUMS`. The version includes the Git revision count and commit, for example `0.2.0.r5.g0123456789ab`. Each pre-release is tied to its exact commit; rerunning a published build preserves its original release assets. Pre-releases do not replace the latest stable release.
 
 To install, download the main `zap-…-x86_64.pkg.tar.zst` asset and `SHA256SUMS` into the same directory, then run:
 
@@ -217,8 +217,6 @@ Dates are UTC calendar dates, with an approximate age where it helps (`2026-07-1
 | `alpm.rs`, `config.rs`, `aur.rs`, `net.rs` | The engine's handle and callbacks, pacman.conf, the AUR RPC and HTTPS |
 | `libalpm/` | The engine, ported from libalpm: databases, versions and dependencies, resolution, conflicts, downloads, signatures, extraction, removal, scriptlets and hooks. It has no UI code |
 | `pactest.rs` | A pacman-compatible front end over the engine, for pacman's pactest suite |
-
-The Zig implementation (`*.zig`, `build.zig`) is kept as the baseline that CI compares output and speed against.
 
 ## Build and transaction flow
 
