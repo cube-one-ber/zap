@@ -300,7 +300,15 @@ impl libalpm::Frontend for Callbacks {
                 ui::note(ui::NoteKind::Warning, &format!("Signing key {fingerprint} ({uid}) is not in the keyring."));
                 *import = ask("Import and trust this key for package verification? [y/N]", true);
             }
-            Question::CorruptedPkg { remove, .. } => *remove = false,
+            // zap never deletes cache files itself; it names the file so the
+            // user can remove it and run again for a fresh download.
+            Question::CorruptedPkg { filepath, remove } => {
+                ui::note(
+                    ui::NoteKind::Failure,
+                    &format!("{filepath} does not match the repository. Delete it and run zap again to download it fresh."),
+                );
+                *remove = false;
+            }
             Question::RemovePkgs { skip, .. } => *skip = false,
         }
     }
