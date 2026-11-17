@@ -170,6 +170,7 @@ pub struct Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
+    #[cfg(test)]
     pub fn kind(&self) -> Kind {
         self.kind
     }

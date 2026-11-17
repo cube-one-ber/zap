@@ -8,6 +8,7 @@ macro_rules! commands {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub enum Command { $($variant,)* }
         impl Command {
+            #[cfg(test)]
             pub const ALL: &'static [Command] = &[$(Command::$variant,)*];
             /// The snake_case identifier (`install_files`), also accepted as a spelling.
             pub fn tag(self) -> &'static str {

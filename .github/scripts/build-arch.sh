@@ -12,6 +12,10 @@ chown -R builder:builder /workspace
 
 # Check fresh proc/device mounts too, as used by zap's package sandbox.
 runuser -u builder -- bwrap --unshare-all --share-net --ro-bind / / --proc /proc --dev /dev -- /usr/bin/true
+# Both binaries must build without compiler or clippy warnings. Only CI denies
+# them: a new compiler's lints should not break the published PKGBUILD.
+runuser -u builder -- cargo clippy --release --locked --bin zap --tests -- -D warnings
+runuser -u builder -- cargo clippy --release --locked --features pactest --bin zap-pactest -- -D warnings
 # makepkg runs build() and check() without container-root privileges.
 runuser -u builder -- bash -c './packaging/source.sh && cd packaging && makepkg --noconfirm'
 

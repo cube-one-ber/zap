@@ -4,10 +4,10 @@
 //! operations exit with status 2 so the harness can tell them apart.
 //!
 //! Build with `cargo build --release --features pactest --bin zap-pactest`.
-#![allow(dead_code)]
 
-// Re-exports this front end does not need are still used by zap itself.
-#[allow(unused_imports)]
+// Engine code and re-exports this front end does not need are used by zap
+// itself; see the matching allowance in src/main.rs.
+#[allow(dead_code, unused_imports)]
 #[path = "libalpm/mod.rs"]
 mod libalpm;
 

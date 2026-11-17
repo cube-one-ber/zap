@@ -1,6 +1,6 @@
 //! Removing packages, as libalpm's remove.c.
 use super::deps::{self, DepMissing};
-use super::log::{self, Event, Operation, Progress};
+use super::log::{self, Event, Progress};
 use super::package::Pkg;
 use super::trans::*;
 use super::{util, Error, ErrorKind, Handle, Result};
@@ -229,11 +229,10 @@ impl Handle {
     /// old files of an upgrade.
     pub(crate) fn remove_single_package(&mut self, oldpkg: &Arc<Pkg>, newpkg: Option<&Pkg>, targ_count: usize, pkg_count: usize) {
         let scriptlets = oldpkg.info().has_scriptlet && !self.trans().has(FLAG_NOSCRIPTLET);
-        let operation = Event::PackageOperationStart { operation: Operation::Remove, oldpkg: Some(oldpkg), newpkg: None };
         if newpkg.is_some() {
             log::debug(&format!("removing old package first ({}-{})\n", oldpkg.name, oldpkg.version));
         } else {
-            log::event(&operation);
+            log::event(&Event::PackageOperationStart);
             log::debug(&format!("removing package {}-{}\n", oldpkg.name, oldpkg.version));
             if scriptlets {
                 let script = self.local_pkgpath(oldpkg, "install");
@@ -249,7 +248,7 @@ impl Handle {
                 let script = self.local_pkgpath(oldpkg, "install");
                 self.runscriptlet(&script, "post_remove", &oldpkg.version, None, false);
             }
-            log::event(&Event::PackageOperationDone { operation: Operation::Remove, oldpkg: Some(oldpkg), newpkg: None });
+            log::event(&Event::PackageOperationDone);
         }
         log::debug(&format!("removing database entry '{}'\n", oldpkg.name));
         if self.local_db_remove(oldpkg).is_err() {
@@ -262,9 +261,6 @@ impl Handle {
     pub(crate) fn remove_packages(&mut self, run_ldconfig: bool) -> Result<()> {
         let remove = self.trans().remove.clone();
         for (i, pkg) in remove.iter().enumerate() {
-            if interrupted() {
-                return Ok(());
-            }
             self.remove_single_package(pkg, None, i + 1, remove.len());
         }
         if run_ldconfig {

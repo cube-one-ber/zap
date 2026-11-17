@@ -11,6 +11,10 @@ mod commands;
 mod config;
 mod errors;
 mod help;
+// zap-pactest drives parts of the engine that zap does not, so dead-code
+// warnings here would name code that is in use. src/pactest.rs has the mirror
+// image of this allowance.
+#[allow(dead_code)]
 mod libalpm;
 mod net;
 mod news;

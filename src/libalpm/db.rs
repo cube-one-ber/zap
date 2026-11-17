@@ -79,10 +79,6 @@ impl Db {
         }
     }
 
-    pub fn is_local(&self) -> bool {
-        self.local
-    }
-
     fn cache(&self) -> &Cache {
         self.cache.get_or_init(|| {
             let loaded = if self.local {
@@ -141,13 +137,6 @@ impl Db {
     pub fn preload(&self) {
         parallel(self.pkgs(), |p| {
             p.info();
-        });
-    }
-
-    /// Parse every installed package's file list in parallel.
-    pub fn preload_files(&self) {
-        parallel(self.pkgs(), |p| {
-            p.files();
         });
     }
 

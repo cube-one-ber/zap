@@ -5,7 +5,6 @@ use super::log::{self, Event};
 use super::package::{Pkg, Reason};
 use super::{ErrorKind, Handle, Result};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub const FLAG_NODEPS: u32 = 1;
@@ -69,17 +68,6 @@ pub struct Trans {
     pub skip_remove: Vec<String>,
 }
 
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-/// `alpm_trans_interrupt`: stop the commit between packages. Async-signal-safe.
-pub fn interrupt() {
-    INTERRUPTED.store(true, Ordering::SeqCst);
-}
-
-pub(crate) fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
-}
-
 impl Trans {
     pub fn has(&self, flag: u32) -> bool {
         self.flags & flag != 0
@@ -103,7 +91,6 @@ impl Handle {
         if flags & FLAG_NOLOCK == 0 {
             self.lock()?;
         }
-        INTERRUPTED.store(false, Ordering::SeqCst);
         self.trans = Some(Trans {
             flags,
             state: State::Initialized,
@@ -252,14 +239,10 @@ impl Handle {
             self.logaction("ALPM", "transaction failed\n");
             return Err(e);
         }
-        if interrupted() {
-            self.logaction("ALPM", "transaction interrupted\n");
-        } else {
-            log::event(&Event::TransactionDone);
-            self.logaction("ALPM", "transaction completed\n");
-            if hooks {
-                let _ = self.hook_run(super::hook::When::PostTransaction);
-            }
+        log::event(&Event::TransactionDone);
+        self.logaction("ALPM", "transaction completed\n");
+        if hooks {
+            let _ = self.hook_run(super::hook::When::PostTransaction);
         }
         self.trans_mut().state = State::Committed;
         Ok(())

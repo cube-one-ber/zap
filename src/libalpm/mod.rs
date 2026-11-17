@@ -57,7 +57,6 @@ macro_rules! error_kinds {
 }
 
 error_kinds! {
-    Memory => "out of memory!",
     System => "unexpected system error",
     BadPerms => "permission denied",
     NotAFile => "could not find or read file",
@@ -66,11 +65,8 @@ error_kinds! {
     DiskSpace => "not enough free disk space",
     HandleLock => "unable to lock database",
     DbOpen => "could not open database",
-    DbCreate => "could not create database",
     DbNotFound => "could not find database",
-    DbInvalid => "invalid or corrupted database",
     DbInvalidSig => "invalid or corrupted database (PGP signature)",
-    DbVersion => "database is incorrect version",
     DbWrite => "could not update database",
     DbRemove => "could not remove database entry",
     ServerBadUrl => "invalid url for server",
@@ -81,7 +77,6 @@ error_kinds! {
     TransDupFilename => "duplicate filename",
     TransNotPrepared => "transaction not prepared",
     TransAbort => "transaction aborted",
-    TransType => "operation not compatible with the transaction type",
     TransNotLocked => "transaction commit attempt when database is not locked",
     TransHookFailed => "failed to run transaction hooks",
     PkgNotFound => "could not find or read package",
@@ -103,7 +98,6 @@ error_kinds! {
     Retrieve => "failed to retrieve some files",
     InvalidRegex => "invalid regular expression",
     Libarchive => "libarchive error",
-    Libcurl => "download library error",
     Gpgme => "gpgme error",
 }
 
@@ -252,7 +246,7 @@ impl Handle {
         let db = &self.syncdbs[index];
         let path = db.path.to_string_lossy().into_owned();
         if !db.path.exists() {
-            log::event(&Event::DatabaseMissing { name: &db.name });
+            log::event(&Event::DatabaseMissing);
             self.syncdbs[index].invalid = false;
             return true;
         }

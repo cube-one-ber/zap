@@ -14,7 +14,6 @@ pub enum SigStatus {
     KeyExpired,
     SigExpired,
     KeyUnknown,
-    KeyDisabled,
     Invalid,
 }
 
@@ -224,7 +223,6 @@ impl Handle {
                     None
                 }
                 SigStatus::SigExpired => Some(format!("signature from \"{name}\" is expired")),
-                SigStatus::KeyDisabled => Some(format!("key \"{name}\" is disabled")),
                 SigStatus::Invalid => Some(format!("signature from \"{name}\" is invalid")),
             };
             if let Some(message) = message {
@@ -459,7 +457,7 @@ pub(crate) fn extract_keyid(identifier: &str, sig: &[u8]) -> Option<Vec<String>>
         }
         pos += 2;
         subpackets(pos, ulen, &mut keys)?;
-        pos += blen.checked_sub(hlen + 8).map_or_else(|| sig.len(), |rest| rest);
+        pos += blen.checked_sub(hlen + 8).unwrap_or(sig.len());
     }
     Some(keys)
 }

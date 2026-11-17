@@ -11,15 +11,6 @@ pub enum Level {
     Debug,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Operation {
-    Install,
-    Upgrade,
-    Reinstall,
-    Downgrade,
-    Remove,
-}
-
 /// Something that happened during a transaction that the front end may show.
 #[derive(Debug)]
 pub enum Event<'a> {
@@ -31,8 +22,8 @@ pub enum Event<'a> {
     InterconflictsDone,
     TransactionStart,
     TransactionDone,
-    PackageOperationStart { operation: Operation, oldpkg: Option<&'a Pkg>, newpkg: Option<&'a Pkg> },
-    PackageOperationDone { operation: Operation, oldpkg: Option<&'a Pkg>, newpkg: Option<&'a Pkg> },
+    PackageOperationStart,
+    PackageOperationDone,
     IntegrityStart,
     IntegrityDone,
     LoadStart,
@@ -42,19 +33,16 @@ pub enum Event<'a> {
     DiskspaceStart,
     DiskspaceDone,
     OptdepRemoval { pkg: &'a Pkg, optdep: &'a Depend },
-    DatabaseMissing { name: &'a str },
+    DatabaseMissing,
     KeyringStart,
     KeyringDone,
     KeyDownloadStart,
     KeyDownloadDone,
-    RetrieveStart,
-    RetrieveDone,
-    RetrieveFailed,
     PkgRetrieveDone,
     PkgRetrieveFailed,
     HookStart { post: bool },
-    HookDone { post: bool },
-    HookRunDone { name: &'a str, desc: &'a str, position: usize, total: usize },
+    HookDone,
+    HookRunDone,
     ScriptletInfo { line: &'a str },
     HookRunStart { name: &'a str, desc: &'a str, position: usize, total: usize },
     PacnewCreated { file: &'a str },
@@ -66,14 +54,16 @@ pub enum Event<'a> {
 #[derive(Debug)]
 pub enum Question<'a> {
     InstallIgnorePkg { pkg: &'a Pkg, install: bool },
-    Replace { old: &'a Pkg, new: &'a Pkg, db: &'a str, replace: bool },
-    Conflict { package1: &'a str, package2: &'a str, reason: &'a Depend, remove: bool },
+    Replace { old: &'a Pkg, new: &'a Pkg, replace: bool },
+    Conflict { package1: &'a str, package2: &'a str, remove: bool },
     SelectProvider { depend: &'a Depend, providers: &'a [Arc<Pkg>], use_index: i32 },
     ImportKey { fingerprint: &'a str, uid: &'a str, import: bool },
     CorruptedPkg { filepath: &'a str, remove: bool },
-    RemovePkgs { packages: &'a [Arc<Pkg>], skip: bool },
+    RemovePkgs { skip: bool },
 }
 
+// Named after libalpm's ALPM_PROGRESS_*_START.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
     AddStart,

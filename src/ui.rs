@@ -97,6 +97,7 @@ pub fn set_color_mode(mode: ColorMode) {
 }
 
 /// Pin capabilities, for deterministic rendering in tests. None detects again.
+#[cfg(test)]
 pub fn set_caps(value: Option<Caps>) {
     state().caps = value;
 }
@@ -380,12 +381,14 @@ fn replace_bytes(input: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 }
 
 /// Collect output in memory instead of writing it, for tests.
+#[cfg(test)]
 pub fn begin_capture() {
     let mut s = state();
     flush_state(&mut s);
     s.capturing = true;
 }
 
+#[cfg(test)]
 pub fn end_capture() -> String {
     let mut s = state();
     s.capturing = false;
@@ -917,10 +920,6 @@ impl Table {
         self.rows.push(values.iter().map(|v| Cell::new(safe(v.as_ref()))).collect());
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
     /// Column widths for a terminal `available` cells wide, or None when the
     /// rows must be stacked instead. If a few outlying rows are all that keep
     /// the table from fitting, the widest columns give way and those rows
@@ -963,6 +962,7 @@ impl Table {
         }
     }
 
+    #[cfg(test)]
     pub fn fits(&self, width: usize) -> bool {
         self.layout(width).is_some()
     }
@@ -1403,6 +1403,7 @@ pub fn date(timestamp: i64) -> String {
 }
 
 /// Date and time in UTC.
+#[cfg(test)]
 pub fn datetime(timestamp: i64) -> String {
     if timestamp <= 0 {
         return "unknown".into();

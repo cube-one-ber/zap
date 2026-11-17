@@ -2,7 +2,7 @@
 //! extracting each one over the root with the backup-file rules, and
 //! recording it in the local database.
 use super::conflict::{llstat, needbackup};
-use super::log::{self, Event, Operation, Progress};
+use super::log::{self, Event, Progress};
 use super::package::{Files, Pkg, Reason};
 use super::trans::*;
 use super::{util, ErrorKind, Handle, Result};
@@ -10,6 +10,14 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// What installing a package does to the installed version, for pacman.log.
+enum Operation {
+    Install,
+    Upgrade,
+    Reinstall,
+    Downgrade,
+}
 
 type Entry<'a> = tar::Entry<'a, Box<dyn Read>>;
 
@@ -253,7 +261,7 @@ impl Handle {
             None => (Operation::Install, Progress::AddStart, "adding"),
         };
         let is_upgrade = oldpkg.is_some();
-        log::event(&Event::PackageOperationStart { operation, oldpkg: oldpkg.as_deref(), newpkg: Some(newpkg) });
+        log::event(&Event::PackageOperationStart);
         let Some(pkgfile) = target.file.as_ref().map(|p| p.to_string_lossy().into_owned()) else {
             return Err(ErrorKind::PkgNotFound.into());
         };
@@ -348,7 +356,7 @@ impl Handle {
                 Operation::Install => format!("installed {name} ({version})\n"),
                 Operation::Downgrade => format!("downgraded {name} ({old} -> {version})\n"),
                 Operation::Reinstall => format!("reinstalled {name} ({version})\n"),
-                _ => format!("upgraded {name} ({old} -> {version})\n"),
+                Operation::Upgrade => format!("upgraded {name} ({old} -> {version})\n"),
             },
         );
         if scriptlets {
@@ -356,7 +364,7 @@ impl Handle {
             let name = if is_upgrade { "post_upgrade" } else { "post_install" };
             self.runscriptlet(&script, name, &newpkg.version, oldver.as_deref(), false);
         }
-        log::event(&Event::PackageOperationDone { operation, oldpkg: oldpkg.as_deref(), newpkg: Some(newpkg) });
+        log::event(&Event::PackageOperationDone);
         result
     }
 
@@ -364,18 +372,12 @@ impl Handle {
     /// package stops the rest and skips ldconfig.
     pub(crate) fn upgrade_packages(&mut self) -> Result<()> {
         let targets = self.trans().add.clone();
-        let mut result = Ok(());
         for (i, target) in targets.iter().enumerate() {
-            if result.is_err() || interrupted() {
-                return result;
-            }
             if self.commit_single_pkg(target, i + 1, targets.len()).is_err() {
-                result = Err(ErrorKind::TransAbort.into());
+                return Err(ErrorKind::TransAbort.into());
             }
         }
-        if result.is_ok() {
-            self.ldconfig();
-        }
-        result
+        self.ldconfig();
+        Ok(())
     }
 }

@@ -681,7 +681,12 @@ impl<'a> Builder<'a> {
 }
 
 fn remove(path: &std::path::Path, dir: bool) -> Result<()> {
-    Ok(if dir { std::fs::remove_dir_all(path)? } else { std::fs::remove_file(path)? })
+    if dir {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn reason_name(reason: Reason) -> &'static str {

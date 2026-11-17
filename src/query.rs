@@ -481,7 +481,7 @@ fn recorded_path(db: &Alpm, input: &str) -> Result<Option<String>> {
     let path = crate::util::join(parent.to_str().unwrap_or(""), base);
     let root = db.cfg.root.trim_end_matches('/');
     match path.strip_prefix(root) {
-        Some(rest) if rest.len() > 0 && rest.starts_with('/') => Ok(Some(rest[1..].to_string())),
+        Some(rest) if rest.starts_with('/') => Ok(Some(rest[1..].to_string())),
         _ => Ok(None),
     }
 }
@@ -692,7 +692,7 @@ pub fn stats(db: &Alpm) -> Result<()> {
     ui::field("Installed size", &ui::size(size));
 
     let mut packages: Vec<&PkgRef> = installed.iter().collect();
-    packages.sort_by(|a, b| b.info().isize.cmp(&a.info().isize));
+    packages.sort_by_key(|p| std::cmp::Reverse(p.info().isize));
     let shown = &packages[..packages.len().min(10)];
     if shown.is_empty() {
         ui::blank();
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn aur_sort_is_deterministic_with_name_tie_breaks() {
         let pkg = |name: &str, votes| aur::Package { Name: name.into(), NumVotes: votes, ..Default::default() };
-        let mut packages = vec![pkg("z", 2), pkg("a", 2), pkg("b", 9)];
+        let mut packages = [pkg("z", 2), pkg("a", 2), pkg("b", 9)];
         packages.sort_by(|a, b| aur_order(a, b, "", SortBy::Votes));
         assert_eq!(["b", "a", "z"], packages.iter().map(|p| p.Name.as_str()).collect::<Vec<_>>()[..]);
         packages.sort_by(|a, b| aur_order(a, b, "", SortBy::Name));

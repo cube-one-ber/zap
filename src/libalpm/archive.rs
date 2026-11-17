@@ -132,9 +132,11 @@ impl Read for Counting {
     }
 }
 
-/// `_alpm_open_archive`: the archive at `path` as a tar stream, with a
-/// counter of the compressed bytes consumed so far.
-pub(crate) fn open_tar(path: &str) -> Result<(tar::Archive<Box<dyn Read>>, std::sync::Arc<std::sync::atomic::AtomicU64>)> {
+/// A tar stream and a counter of the compressed bytes consumed so far.
+pub(crate) type TarStream = (tar::Archive<Box<dyn Read>>, std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+/// `_alpm_open_archive`: the archive at `path` as a tar stream.
+pub(crate) fn open_tar(path: &str) -> Result<TarStream> {
     let (file, _) = open(path)?;
     let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counting = Counting { inner: file, read: read.clone() };

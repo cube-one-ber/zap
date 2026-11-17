@@ -536,7 +536,7 @@ mod tests {
         let a = query::installed(&db, "jdk-a").unwrap().clone();
         let b = query::installed(&db, "jdk-b").unwrap().clone();
         // jdk-b still provides java-runtime: nothing breaks.
-        assert!(broken_by(&db, &[a.clone()]).is_empty());
+        assert!(broken_by(&db, std::slice::from_ref(&a)).is_empty());
         assert_eq!(vec!["app needs java-runtime".to_string()], broken_by(&db, &[a, b]));
     }
 

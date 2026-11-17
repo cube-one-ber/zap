@@ -76,7 +76,7 @@ impl ServerErrors {
     /// Servers are skipped after a hard error or too many soft ones.
     fn skip_server(&self, url: &str) -> bool {
         let n = self.count(url);
-        n < 0 || n >= SERVER_ERROR_LIMIT
+        !(0..SERVER_ERROR_LIMIT).contains(&n)
     }
 
     /// Cache servers are skipped only after a hard error.

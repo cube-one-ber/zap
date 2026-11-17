@@ -53,7 +53,7 @@ impl<R: Read> Lzw<R> {
             oldcode: None,
             finbyte: 0,
             prefix: vec![0; 1 << 16],
-            suffix: (0..=255u8).chain(std::iter::repeat(0).take((1 << 16) - 256)).collect(),
+            suffix: (0..=255u8).chain(std::iter::repeat_n(0, (1 << 16) - 256)).collect(),
             stack: Vec::new(),
             done: false,
         })

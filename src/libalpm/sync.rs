@@ -54,7 +54,7 @@ impl Handle {
                 continue;
             }
             let dbname = self.syncdbs[sdb].name.clone();
-            let mut q = Question::Replace { old: lpkg, new: &spkg, db: &dbname, replace: false };
+            let mut q = Question::Replace { old: lpkg, new: &spkg, replace: false };
             log::question(&mut q);
             if !matches!(q, Question::Replace { replace: true, .. }) {
                 continue;
@@ -415,7 +415,7 @@ impl Handle {
                 }
             }
             if !unresolvable.is_empty() {
-                let mut q = Question::RemovePkgs { packages: &unresolvable, skip: false };
+                let mut q = Question::RemovePkgs { skip: false };
                 log::question(&mut q);
                 if !matches!(q, Question::RemovePkgs { skip: true, .. }) {
                     let mut e = Error::new(ErrorKind::UnsatisfiedDeps);
@@ -493,7 +493,7 @@ impl Handle {
                     continue;
                 }
                 log::debug(&format!("package '{name1}-{}' conflicts with '{name2}-{}'\n", c.package1.version, c.package2.version));
-                let mut q = Question::Conflict { package1: &name1, package2: &name2, reason: &c.reason, remove: false };
+                let mut q = Question::Conflict { package1: &name1, package2: &name2, remove: false };
                 log::question(&mut q);
                 if matches!(q, Question::Conflict { remove: true, .. }) {
                     log::debug(&format!("electing '{name2}' for removal\n"));
@@ -672,7 +672,7 @@ impl Handle {
         log::event(&Event::IntegrityStart);
         let targets: Vec<Arc<Pkg>> = self.trans().add.iter().filter(|a| a.file.is_none()).map(|a| a.pkg.clone()).collect();
         let total = self.trans().add.len();
-        let mut errors: Vec<(Arc<Pkg>, String, i32, ErrorKind, Vec<SigResult>)> = Vec::new();
+        let mut errors = Vec::new();
         let mut validations = Vec::new();
         for (current, pkg) in targets.iter().enumerate() {
             log::progress(Progress::IntegrityStart, "", (current * 100 / total.max(1)) as i32, total, current);

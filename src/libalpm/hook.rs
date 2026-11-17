@@ -327,7 +327,7 @@ impl Handle {
         let stdin = hook.needs_targets.then(|| {
             hook.matches.sort();
             hook.matches.dedup();
-            hook.matches.iter().flat_map(|m| m.bytes().chain([b'\n'])).collect()
+            hook.matches.iter().flat_map(|m| m.bytes().chain(*b"\n")).collect()
         });
         util::run_chroot(self, argv[0], &argv, stdin)
     }
@@ -425,12 +425,12 @@ impl Handle {
             if !self.run_hook(hook) && hook.abort_on_fail {
                 ok = false;
             }
-            log::event(&Event::HookRunDone { name: &name, desc: &desc, position, total });
+            log::event(&Event::HookRunDone);
             if !ok && !post {
                 break;
             }
         }
-        log::event(&Event::HookDone { post });
+        log::event(&Event::HookDone);
         if ok {
             Ok(())
         } else {
