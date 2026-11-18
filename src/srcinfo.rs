@@ -19,6 +19,8 @@ pub struct Metadata {
     pub names: Vec<String>,
     /// Runtime, make and check dependencies of every package in the base.
     pub deps: Vec<String>,
+    /// The make and check dependencies alone: needed to build, not to run.
+    pub build_deps: Vec<String>,
     pub provides: Vec<String>,
     scoped_provides: Vec<Provide>,
 }
@@ -61,6 +63,9 @@ impl Metadata {
                         result.scoped_provides.push(Provide { owner: current_package.map(Into::into), spec: value.into() });
                     } else {
                         append_unique(&mut result.deps, value);
+                        if field != "depends" {
+                            append_unique(&mut result.build_deps, value);
+                        }
                     }
                 }
             }

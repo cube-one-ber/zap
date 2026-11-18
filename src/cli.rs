@@ -70,6 +70,8 @@ pub struct Options {
     /// The command a help request is about, when it names one.
     pub topic: Option<Command>,
     pub names: Vec<String>,
+    /// Targets given as aur/NAME: taken from the AUR whatever the scope.
+    pub aur_names: Vec<String>,
     pub scope: Scope,
     pub dry: bool,
     pub devel: bool,
@@ -95,6 +97,7 @@ impl Options {
             command,
             topic: None,
             names: Vec::new(),
+            aur_names: Vec::new(),
             scope: Scope::All,
             dry: false,
             devel: false,
@@ -179,7 +182,7 @@ pub static SPECS: [Spec; 28] = [
     s(C::Search, "search", G::Everyday, "Find packages in repositories and the AUR")
         .alias("-Ss")
         .takes("TERM", T::Term)
-        .about("Searches the cached repository databases and live AUR metadata. Repository results show the installed size and build date; AUR results show votes, popularity, the maintainer and the last modification. Results you already have installed are marked.")
+        .about("Searches the cached repository databases and live AUR metadata. Repository results show the installed size and build date; AUR results show votes, popularity, the maintainer and the last modification. Results you already have installed are marked. With --quiet, each match prints as repository/name or aur/name, the form zap install takes. Exits with status 1 when nothing matches, as pacman -Ss does.")
         .examples(&["zap search ripgrep", "zap search browser --aur --sortby popularity", "zap search alice --aur --searchby maintainer"]),
     s(C::Select, "select", G::Everyday, "Search, choose numbered results, then install them")
         .takes("TERM", T::Term)
@@ -188,7 +191,7 @@ pub static SPECS: [Spec; 28] = [
     s(C::Install, "install", G::Everyday, "Resolve dependencies, review sources, build and install")
         .alias("-S")
         .takes("PACKAGES", T::Required)
-        .about("Repository packages are installed directly. AUR packages are fetched, shown to you for review, built as your user in a sandbox, and installed through a libalpm transaction that you confirm separately. An installed package or a repository package satisfies a dependency before the AUR is consulted.")
+        .about("Repository packages are installed directly. AUR packages are fetched, shown to you for review, built as your user in a sandbox (private home, read-only system and package database, network for downloads only), and installed through a libalpm transaction that you confirm separately. An installed package or a repository package satisfies a dependency before the AUR is consulted.")
         .examples(&["zap install ripgrep", "zap install google-chrome --dry-run", "zap install some-library --asdeps --needed"]),
     s(C::Upgrade, "upgrade", G::Everyday, "Refresh and upgrade repositories, then AUR packages")
         .alias("-Syu")
@@ -196,7 +199,7 @@ pub static SPECS: [Spec; 28] = [
         .examples(&["zap upgrade", "zap upgrade --devel", "zap upgrade --aur --dry-run"]),
     s(C::Updates, "updates", G::Everyday, "List available repository and AUR updates")
         .alias("-Qu")
-        .about("Compares installed versions against the cached repository databases and live AUR metadata without changing anything. The repository databases are only as fresh as the last upgrade.")
+        .about("Compares installed versions against the cached repository databases and live AUR metadata without changing anything. The repository databases are only as fresh as the last upgrade. Exits with status 1 when there is nothing to update, as pacman -Qu does.")
         .examples(&["zap updates", "zap updates --aur --devel", "zap updates --quiet"]),
     s(C::Remove, "remove", G::Everyday, "Remove packages with dependency checks")
         .alias("-R")
@@ -225,11 +228,12 @@ pub static SPECS: [Spec; 28] = [
     s(C::Foreign, "foreign", G::Inspect, "List packages absent from the repositories")
         .alias("-Qm")
         .takes("[PACKAGES]", T::Optional)
-        .about("Lists installed packages that no configured repository provides: usually AUR packages and locally built ones.")
+        .about("Lists installed packages that no configured repository provides: usually AUR packages and locally built ones. Exits with status 1 when there are none, as pacman -Qm does.")
         .examples(&["zap foreign"]),
     s(C::Files, "files", G::Inspect, "List the files a package installed")
         .alias("-Ql")
         .takes("PACKAGES", T::Required)
+        .about("Lists each package's files, without the directories it creates. With --quiet, only the paths are printed, one per line.")
         .examples(&["zap files ripgrep", "zap files ripgrep --quiet"]),
     s(C::Owns, "owns", G::Inspect, "Find which package owns a file")
         .alias("-Qo")
@@ -239,7 +243,7 @@ pub static SPECS: [Spec; 28] = [
     s(C::Check, "check", G::Inspect, "Check for missing installed files")
         .alias("-Qk")
         .takes("[PACKAGES]", T::Optional)
-        .about("Checks that every file a package installed still exists. This detects missing files only; contents and checksums are not verified. Exits with a failure status when any file is missing.")
+        .about("Checks that every file a package installed still exists. This detects missing files only; contents and checksums are not verified. Exits with a failure status when any file is missing. Files in directories your user cannot read are listed as not checked and do not change the exit status.")
         .examples(&["zap check", "zap check pacman"]),
     s(C::Stats, "stats", G::Inspect, "Show package counts, disk usage and the largest packages").alias("-Ps"),
     s(C::News, "news", G::Inspect, "Read Arch Linux news before upgrading")
@@ -274,14 +278,13 @@ pub static SPECS: [Spec; 28] = [
         .examples(&["zap pkgbuild some-aur-package"]),
     s(C::Orphans, "orphans", G::Maintain, "List dependencies nothing needs any more")
         .alias("-Qdt")
-        .about("Lists packages installed as dependencies that no installed package requires or optionally uses.")
+        .about("Lists packages installed as dependencies that no installed package requires or optionally uses. Exits with status 1 when there are none, as pacman -Qdt does.")
         .examples(&["zap orphans", "zap orphans --quiet"]),
     s(C::Autoremove, "autoremove", G::Maintain, "Review and remove orphan dependencies")
         .examples(&["zap autoremove --dry-run", "zap autoremove"]),
-    s(C::Clean, "clean", G::Maintain, "Clear cached sources and build outputs")
-        .alias("-Sc")
+    s(C::Clean, "clean", G::Maintain, "Clear zap's build cache, not pacman's package cache")
         .takes("[BASES]", T::Optional)
-        .about("Clears the whole build cache, or only the named package bases, after confirmation. The pacman package cache is not touched.")
+        .about("Clears the whole build cache, or only the named package bases, after confirmation. The pacman package cache is not touched. Review history goes too: the next review of a cleaned package shows every file in full.")
         .examples(&["zap clean", "zap clean some-package-base"]),
     s(C::Reason, "reason", G::Maintain, "Mark packages as explicit or as dependencies")
         .alias("-D")
@@ -305,15 +308,16 @@ struct Alias {
     command: Command,
     scope: Scope,
     quiet: bool,
-    purge: bool,
+    recursive: bool,
+    nosave: bool,
 }
 
 const fn alias(text: &'static str, command: Command) -> Alias {
-    Alias { text, command, scope: Scope::All, quiet: false, purge: false }
+    Alias { text, command, scope: Scope::All, quiet: false, recursive: false, nosave: false }
 }
 
 // Pacman-style spellings, including the combined forms people type from habit.
-const ALIASES: [Alias; 8] = [
+const ALIASES: [Alias; 10] = [
     alias("--help", C::Help),
     alias("-V", C::Version),
     Alias { scope: Scope::Aur, ..alias("-Sua", C::Upgrade) },
@@ -321,8 +325,29 @@ const ALIASES: [Alias; 8] = [
     Alias { quiet: true, ..alias("-Qq", C::List) },
     Alias { quiet: true, ..alias("-Qmq", C::Foreign) },
     Alias { quiet: true, ..alias("-Qdtq", C::Orphans) },
-    Alias { purge: true, ..alias("-Rns", C::Remove) },
+    Alias { recursive: true, nosave: true, ..alias("-Rns", C::Remove) },
+    Alias { recursive: true, ..alias("-Rs", C::Remove) },
+    Alias { nosave: true, ..alias("-Rn", C::Remove) },
 ];
+
+/// Every pacman-style spelling: each command's own alias, then the combined forms.
+fn pacman_aliases() -> impl Iterator<Item = Alias> {
+    SPECS.iter().filter(|e| e.alias.starts_with('-') && e.alias.len() > 2).map(|e| alias(e.alias, e.command)).chain(ALIASES)
+}
+
+/// A pacman-style operation as its letter and its sorted, distinct flags,
+/// so -Rsn matches -Rns and -Syyu matches -Syu, as pacman takes them.
+fn pacman_letters(text: &str) -> Option<(char, Vec<char>)> {
+    let mut chars = text.strip_prefix('-')?.chars();
+    let op = chars.next().filter(char::is_ascii_uppercase)?;
+    let mut flags: Vec<char> = chars.collect();
+    if !flags.iter().all(char::is_ascii_lowercase) {
+        return None;
+    }
+    flags.sort_unstable();
+    flags.dedup();
+    Some((op, flags))
+}
 
 fn resolve(text: &str) -> Option<(Command, Option<Alias>)> {
     for entry in &SPECS {
@@ -330,7 +355,25 @@ fn resolve(text: &str) -> Option<(Command, Option<Alias>)> {
             return Some((entry.command, None));
         }
     }
-    ALIASES.iter().find(|a| a.text == text).map(|a| (a.command, Some(*a)))
+    if let Some(found) = ALIASES.iter().find(|a| a.text == text) {
+        return Some((found.command, Some(*found)));
+    }
+    // The same flags in another order or repeated, with q meaning --quiet.
+    let (op, flags) = pacman_letters(text)?;
+    let quiet = flags.contains(&'q');
+    let unquiet: Vec<char> = flags.iter().copied().filter(|&f| f != 'q').collect();
+    pacman_aliases().find_map(|a| {
+        let (aop, aflags) = pacman_letters(a.text)?;
+        if aop != op {
+            None
+        } else if aflags == flags {
+            Some((a.command, Some(a)))
+        } else if quiet && aflags == unquiet {
+            Some((a.command, Some(Alias { quiet: true, ..a })))
+        } else {
+            None
+        }
+    })
 }
 
 // ── Options ─────────────────────────────────────────────────────────────────
@@ -410,13 +453,13 @@ const fn o(flag: Flag, long: &'static str, summary: &'static str, commands: Comm
 }
 
 pub static OPTIONS: [OptionSpec; 20] = [
-    o(Flag::DryRun, "--dry-run", "Show the plan without building, elevating or changing the system", BUILDS.union(CommandSet::of(&[C::InstallFiles, C::Remove, C::Autoremove, C::Clean, C::Reason]))),
+    o(Flag::DryRun, "--dry-run", "Show what would happen without building, deleting or changing the system", BUILDS.union(CommandSet::of(&[C::InstallFiles, C::Remove, C::Autoremove, C::Clean, C::Reason]))),
     o(Flag::Needed, "--needed", "Skip targets that are already installed and current", CommandSet::of(&[C::Install, C::InstallFiles, C::Select])),
     o(Flag::Asdeps, "--asdeps", "Mark the requested packages as dependencies", CommandSet::of(&[C::Install, C::InstallFiles, C::InstallLocal, C::Select, C::Reason])),
     o(Flag::Asexplicit, "--asexplicit", "Mark the requested packages as explicitly installed", CommandSet::of(&[C::Install, C::InstallFiles, C::InstallLocal, C::Select, C::Reason])),
-    OptionSpec { short: "-a", ..o(Flag::Aur, "--aur", "Only consider the AUR for the requested packages", SCOPED) },
-    o(Flag::Repo, "--repo", "Only consider repositories for the requested packages", SCOPED),
-    o(Flag::Devel, "--devel", "Also rebuild installed VCS packages such as -git", CommandSet::of(&[C::Updates, C::Upgrade])),
+    OptionSpec { short: "-a", ..o(Flag::Aur, "--aur", "Limit the command to the AUR", SCOPED) },
+    o(Flag::Repo, "--repo", "Limit the command to the repositories", SCOPED),
+    o(Flag::Devel, "--devel", "Also check installed VCS packages such as -git for new commits", CommandSet::of(&[C::Updates, C::Upgrade])),
     o(Flag::Recursive, "--recursive", "Also remove dependencies nothing else needs", CommandSet::of(&[C::Remove])),
     o(Flag::Nosave, "--nosave", "Delete configuration files instead of keeping .pacsave copies", CommandSet::of(&[C::Remove])),
     o(Flag::Sandbox, "--sandbox", "Isolate every build phase with bubblewrap (default)", BUILDS),
@@ -425,7 +468,7 @@ pub static OPTIONS: [OptionSpec; 20] = [
     o(Flag::Cleanafter, "--cleanafter", "Delete untracked build files after installing", CommandSet::of(&[C::Install, C::Select, C::Upgrade, C::InstallLocal])),
     OptionSpec { value: "FIELD", ..o(Flag::Searchby, "--searchby", "AUR field to match: name, name-desc (default), maintainer, provides, depends, makedepends, checkdepends, optdepends", SEARCHES) },
     OptionSpec { value: "ORDER", ..o(Flag::Sortby, "--sortby", "AUR result order: votes (default), popularity, name, modified", SEARCHES) },
-    OptionSpec { short: "-q", ..o(Flag::Quiet, "--quiet", "Print bare names (paths for files), one per line", CommandSet::of(&[C::Search, C::LocalSearch, C::Updates, C::List, C::Foreign, C::Orphans, C::Files, C::Owns])) },
+    OptionSpec { short: "-q", ..o(Flag::Quiet, "--quiet", "Bare output, one per line: names (repository/name for search, paths for files)", CommandSet::of(&[C::Search, C::LocalSearch, C::Updates, C::List, C::Foreign, C::Orphans, C::Files, C::Owns])) },
     OptionSpec { value: "TOOL", ..o(Flag::Elevate, "--elevate", "Gain root with run0 or sudo; default $ZAP_ELEVATE, else run0 with systemd and polkit, else sudo", ELEVATING) },
     o(Flag::Noconfirm, "--noconfirm", "Run unattended: approve build files and the transaction without asking; root still needs run0 or sudo to authorize", CommandSet::of(&[C::Install, C::Upgrade, C::InstallLocal, C::InstallFiles])),
     OptionSpec { value: "WHEN", ..o(Flag::Color, "--color", "Style output: auto (default), always or never", EVERY) },
@@ -461,9 +504,17 @@ pub fn color_preference<S: AsRef<str>>(args: &[S]) -> Option<ColorMode> {
 
 pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Options> {
     let args: Vec<&str> = args.iter().map(|a| a.as_ref()).collect();
-    if args.is_empty() {
+    // Nothing but a colour choice, such as `zap --color never`, is the overview too.
+    let only_color = match args.as_slice() {
+        [] => true,
+        [one] => one.starts_with("--color="),
+        ["--color", _] => true,
+        _ => false,
+    };
+    if only_color {
         return Ok(Options::new(C::Help));
     }
+    let args = command_first(&args);
     let Some((command, alias)) = resolve(args[0]) else { return Err(unknown_command(args[0])) };
     // Asking for help never fails on what else was typed.
     if command != C::Help {
@@ -480,8 +531,8 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Options> {
     if let Some(alias) = alias {
         o.scope = alias.scope;
         o.quiet = alias.quiet;
-        o.recursive = alias.purge;
-        o.nosave = alias.purge;
+        o.recursive = alias.recursive;
+        o.nosave = alias.nosave;
     }
     let mut positional = false;
     let mut i = 1;
@@ -500,13 +551,14 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Options> {
         }
         let equals = if arg.starts_with("--") { arg.find('=') } else { None };
         let key = &arg[..equals.unwrap_or(arg.len())];
-        let Some(entry) = option(key) else { return Err(unknown_option(key)) };
+        let Some(entry) = option(key) else { return Err(unknown_option(key, o.command)) };
         if entry.flag == Flag::Help {
             let topic = if o.command == C::Help { None } else { Some(o.command) };
             return Ok(Options { topic, color: o.color, ..Options::new(C::Help) });
         }
         if !entry.commands.contains(o.command) {
-            return Err(errors::with(Kind::OptionNotValidForCommand, format!("{} with {}", entry.long, spec(o.command).name)));
+            let name = spec(o.command).name;
+            return Err(errors::with_hint(Kind::OptionNotValidForCommand, options_hint(o.command), format!("{} with {name}", entry.long)));
         }
         let mut value = "";
         if !entry.value.is_empty() {
@@ -573,21 +625,59 @@ fn apply(o: &mut Options, flag: Flag, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Options typed before the command, as in `zap --color never search x`,
+/// moved after it. Anything else in front of the command is left for the
+/// parser to report.
+fn command_first<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut i = 0;
+    while i < args.len() && resolve(args[i]).is_none() {
+        let key = args[i].split('=').next().unwrap_or_default();
+        match option(key) {
+            Some(entry) if !entry.value.is_empty() && !args[i].contains('=') => i += 2,
+            Some(_) => i += 1,
+            None => return args.to_vec(),
+        }
+    }
+    if i == 0 || i >= args.len() {
+        return args.to_vec();
+    }
+    let mut out = vec![args[i]];
+    out.extend_from_slice(&args[..i]);
+    out.extend_from_slice(&args[i + 1..]);
+    out
+}
+
+fn options_hint(command: Command) -> String {
+    format!("Run zap help {} to list the options it accepts.", spec(command).name)
+}
+
 /// Rules that involve more than one option, and the targets a command takes.
 fn validate(o: &mut Options) -> Result<()> {
-    if o.command == C::Reason && o.reason.is_none() {
-        return errors::fail(Kind::InstallationReasonRequired);
+    if o.command == C::Reason && o.reason.is_none() && !o.names.is_empty() {
+        let hint = format!("Add --asdeps or --asexplicit: zap reason {} --asdeps", o.names.join(" "));
+        return Err(errors::hinted(Kind::InstallationReasonRequired, hint));
     }
     if o.needed && o.rebuild_tree {
         return Err(conflicting("--needed and --rebuildtree"));
     }
     let entry = spec(o.command);
     match entry.targets {
-        T::None if !o.names.is_empty() => return Err(errors::with(Kind::UnexpectedTargets, entry.name)),
-        T::Term if o.names.is_empty() => return errors::fail(Kind::SearchTermRequired),
+        // pacman's -Syu PKG upgrades and installs in one go; zap takes two steps.
+        T::None if !o.names.is_empty() && o.command == C::Upgrade => {
+            let hint = format!("Run zap upgrade, then zap install {}.", o.names.join(" "));
+            return Err(errors::with_hint(Kind::UnexpectedTargets, hint, entry.name));
+        }
+        T::None if !o.names.is_empty() => {
+            return Err(errors::with_hint(Kind::UnexpectedTargets, format!("Usage: zap {}", entry.name), entry.name));
+        }
+        T::Term if o.names.is_empty() => {
+            return Err(errors::hinted(Kind::SearchTermRequired, format!("Usage: zap {} TERM", entry.name)));
+        }
         T::Required if o.names.is_empty() => {
-            let hint = format!("Usage: zap {} {}", entry.name, entry.operands);
-            return Err(errors::with_hint(Kind::PackageNameRequired, hint, format!("zap {}", entry.name)));
+            // reason also needs its flag, or the next attempt fails again.
+            let flag = if o.command == Command::Reason && o.reason.is_none() { " --asdeps|--asexplicit" } else { "" };
+            let hint = format!("Usage: zap {} {}{flag}", entry.name, entry.operands);
+            return Err(errors::hinted(Kind::PackageNameRequired, hint));
         }
         T::Topic => {
             if o.names.len() > 1 {
@@ -603,8 +693,41 @@ fn validate(o: &mut Options) -> Result<()> {
 }
 
 fn unknown_command(text: &str) -> errors::Error {
-    if text.starts_with('-') {
-        return errors::with_hint(Kind::UnknownCommand, "Options go after the command: zap COMMAND [OPTIONS].", text);
+    if option(text.split('=').next().unwrap_or_default()).is_some() {
+        return Kind::CommandRequired.into();
+    }
+    // pacman's -Sy without -u is a partial upgrade, which Arch does not support.
+    if text.starts_with("-S") && text.contains('y') && !text.contains('u') {
+        return errors::with(Kind::PartialUpgrade, text);
+    }
+    // pacman's -Sc clears the package cache, which zap clean does not touch.
+    if text.starts_with("-Sc") {
+        return errors::with_hint(Kind::UnknownCommand, "pacman -Sc or paccache clears pacman's package cache. zap clean clears zap's build cache.", text);
+    }
+    // Another pacman operation: the alias of that operation that keeps every
+    // flag and adds fewest. Dropping a flag would change the meaning (-Sw
+    // downloads only), so then zap says it has no equivalent.
+    if let Some((op, mut flags)) = pacman_letters(text) {
+        flags.retain(|&f| f != 'q');
+        let mut best: Option<(usize, Alias)> = None;
+        for a in pacman_aliases() {
+            let Some((aop, aflags)) = pacman_letters(a.text) else { continue };
+            let added = aflags.len() - flags.len();
+            if aop == op && flags.iter().all(|f| aflags.contains(f)) && best.is_none_or(|(d, _)| added < d) {
+                best = Some((added, a));
+            }
+        }
+        let bare = format!("-{op}");
+        let suggestion = match best {
+            Some((_, a)) => Some((a.text.to_string(), a.command)),
+            None if flags.is_empty() => resolve(&bare).map(|(command, _)| (bare, command)),
+            None => None,
+        };
+        let hint = match suggestion {
+            Some((alias, command)) => format!("Did you mean {alias} (zap {})?", spec(command).name),
+            None => format!("zap has no equivalent of pacman {text}. Run zap help to see its commands."),
+        };
+        return errors::with_hint(Kind::UnknownCommand, hint, text);
     }
     let names: Vec<&str> = SPECS.iter().map(|e| e.name).collect();
     match nearest(text, &names) {
@@ -613,11 +736,16 @@ fn unknown_command(text: &str) -> errors::Error {
     }
 }
 
-fn unknown_option(text: &str) -> errors::Error {
-    let names: Vec<&str> = OPTIONS.iter().map(|e| e.long).collect();
+fn unknown_option(text: &str, command: Command) -> errors::Error {
+    let names: Vec<&str> = OPTIONS.iter().filter(|e| e.commands.contains(command)).map(|e| e.long).collect();
+    // pacman's single letters for these, as in -Rsn.
+    let pacman = [("-s", "--recursive"), ("-n", "--nosave")];
+    if let Some((_, long)) = pacman.iter().find(|(short, long)| *short == text && names.contains(long)) {
+        return errors::with_hint(Kind::UnknownOption, format!("Did you mean {long}?"), text);
+    }
     match nearest(text, &names) {
         Some(m) => errors::with_hint(Kind::UnknownOption, format!("Did you mean {m}?"), text),
-        None => errors::with(Kind::UnknownOption, text),
+        None => errors::with_hint(Kind::UnknownOption, options_hint(command), text),
     }
 }
 
@@ -681,6 +809,21 @@ mod tests {
     }
 
     #[test]
+    fn pacman_flags_match_in_any_order() {
+        let o = parse(&["-Rsn", "x"]).unwrap();
+        assert!(o.command == C::Remove && o.recursive && o.nosave);
+        let o = parse(&["-Rs", "x"]).unwrap();
+        assert!(o.recursive && !o.nosave);
+        assert!(parse(&["-Syyu"]).unwrap().command == C::Upgrade);
+        let o = parse(&["-Qtdq"]).unwrap();
+        assert!(o.command == C::Orphans && o.quiet);
+        let hint = parse(&["-Su"]).unwrap_err().hint.unwrap_or_default();
+        assert_eq!(hint, "Did you mean -Syu (zap upgrade)?");
+        let hint = parse(&["-Sw"]).unwrap_err().hint.unwrap_or_default();
+        assert!(hint.starts_with("zap has no equivalent of pacman -Sw."));
+    }
+
+    #[test]
     fn cli_scopes_aliases_and_contradictory_or_ignored_flags() {
         let scoped_upgrade = parse(&["-Sua", "--devel", "--dry-run"]).unwrap();
         assert_eq!(Scope::Aur, scoped_upgrade.scope);
@@ -732,6 +875,17 @@ mod tests {
         assert_eq!(Kind::PackageNameRequired, kind(parse(&["install"])));
         assert_eq!(Kind::InstallationReasonRequired, kind(parse(&["reason", "foo"])));
         assert!(parse(&["list"]).unwrap().names.is_empty());
+    }
+
+    #[test]
+    fn options_may_come_before_the_command() {
+        let o = parse(&["--color", "never", "--dry-run", "-S", "foo"]).unwrap();
+        assert_eq!((C::Install, ColorMode::Never, true), (o.command, o.color, o.dry));
+        assert_eq!(vec!["foo".to_string()], o.names);
+        assert_eq!(Kind::CommandRequired, kind(parse(&["--dry-run"])));
+        assert_eq!(C::Help, parse(&["--color", "never"]).unwrap().command);
+        assert_eq!(Kind::OptionNotValidForCommand, kind(parse(&["--needed", "search", "foo"])));
+        assert_eq!(Kind::UnknownCommand, kind(parse(&["--bogus", "search"])));
     }
 
     #[test]

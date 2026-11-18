@@ -72,6 +72,8 @@ struct State {
     progress_key: Option<u64>,
     progress_percent: usize,
     progress_time: i64,
+    /// The last two bytes written to standard output, to avoid doubled blank lines.
+    tail: [u8; 2],
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -84,6 +86,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     progress_key: None,
     progress_percent: 0,
     progress_time: 0,
+    tail: [0, 0],
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -298,7 +301,17 @@ fn flush_state(s: &mut State) {
     let c = caps_of(s);
     let bytes = plain(&s.pending, c);
     write_all(1, &bytes);
+    s.tail = ending(s);
     s.pending.clear();
+}
+
+/// The last two bytes of standard output, counting what is still pending.
+fn ending(s: &State) -> [u8; 2] {
+    match s.pending.as_slice() {
+        [.., a, b] => [*a, *b],
+        [b] => [s.tail[1], *b],
+        [] => s.tail,
+    }
 }
 
 fn write_all(fd: i32, bytes: &[u8]) {
@@ -380,6 +393,65 @@ fn replace_bytes(input: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Run `body`, showing what it prints through the user's pager when that is
+/// taller than the terminal, as git does. Otherwise, or when no pager starts,
+/// the output is written directly.
+pub fn paged<T>(body: impl FnOnce() -> T) -> T {
+    let rows = terminal_rows();
+    {
+        let mut s = state();
+        if s.capturing || rows.is_none() || !caps_of(&mut s).live {
+            drop(s);
+            return body();
+        }
+        flush_state(&mut s);
+        s.capturing = true;
+    }
+    let result = body();
+    let mut s = state();
+    s.capturing = false;
+    let c = caps_of(&mut s);
+    let bytes = plain(&std::mem::take(&mut s.pending), c);
+    drop(s);
+    let lines = bytes.iter().filter(|&&b| b == b'\n').count();
+    if lines + 2 < rows.unwrap_or(usize::MAX) || !page(&bytes) {
+        write_all(1, &bytes);
+    }
+    result
+}
+
+/// The terminal's height, when standard output is one.
+fn terminal_rows() -> Option<usize> {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        (libc::isatty(1) != 0 && libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0).then_some(ws.ws_row as usize)
+    }
+}
+
+/// Feed `bytes` to $PAGER (default less) and wait for it to exit. False
+/// when the pager failed, such as a $PAGER that is not installed, so the
+/// caller prints the text instead.
+fn page(bytes: &[u8]) -> bool {
+    use std::io::Write;
+    let pager = env("PAGER").filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "less".into());
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", &pager]).stdin(std::process::Stdio::piped());
+    // Like git: keep colours, and leave short output on screen.
+    if env("LESS").is_none() {
+        command.env("LESS", "FRX");
+    }
+    let Ok(mut child) = command.spawn() else { return false };
+    // Ctrl-C belongs to the pager while it runs, as with git.
+    crate::signals::defer_interrupts();
+    if let Some(mut stdin) = child.stdin.take() {
+        // The reader may quit early; that is not a failure.
+        let _ = stdin.write_all(bytes);
+    }
+    let shown = child.wait().is_ok_and(|status| status.success());
+    crate::signals::restore();
+    shown
+}
+
 /// Collect output in memory instead of writing it, for tests.
 #[cfg(test)]
 pub fn begin_capture() {
@@ -408,6 +480,21 @@ pub fn print(text: &str) {
 
 pub fn blank() {
     print("\n");
+}
+
+/// A path for display, with the home directory as ~, as a shell takes it.
+pub fn home_path(path: &str) -> String {
+    match env("HOME").filter(|home| home.len() > 1) {
+        Some(home) if path.starts_with(&format!("{home}/")) => format!("~{}", &path[home.len()..]),
+        _ => path.to_string(),
+    }
+}
+
+/// A blank line, unless the output already ends with one.
+pub fn separate() {
+    if ending(&state()) != *b"\n\n" {
+        blank();
+    }
 }
 
 /// Standard error, ordered after pending standard output.
@@ -524,8 +611,8 @@ pub fn display_width(s: &str) -> usize {
     s.chars().map(cell_width).sum()
 }
 
-/// Wrap at word boundaries, splitting long tokens without splitting UTF-8
-/// sequences. Continuation lines are indented; the first line is not.
+/// Wrap at word boundaries; a word longer than the line is kept whole.
+/// Continuation lines are indented; the first line is not.
 pub fn wrapped(s: &str, width: usize, indent: usize) -> String {
     let mut out = String::new();
     let available = width.saturating_sub(indent).max(1);
@@ -547,10 +634,11 @@ pub fn wrapped(s: &str, width: usize, indent: usize) -> String {
             stop = at + ch.len_utf8();
         }
         if stop < rest.len() && bytes[stop] != b' ' {
-            if let Some(last) = space {
-                if last > 0 {
-                    stop = last;
-                }
+            match space {
+                Some(last) if last > 0 => stop = last,
+                // A word longer than the line, such as a path, overflows
+                // whole so it can still be copied.
+                _ => stop = rest[stop..].find(' ').map_or(rest.len(), |i| stop + i),
             }
         }
         out.push_str(rest[..stop].trim_end_matches(' '));
@@ -619,7 +707,10 @@ pub fn heading(title: &str, detail: &str) {
     let clean_title = safe(title);
     let clean_detail = safe(detail);
     let mut out = Out::new();
-    out.put("\n");
+    // A heading follows one blank line, never two.
+    if ending(&state()) != *b"\n\n" {
+        out.put("\n");
+    }
     out.paint(Tone::Accent, "▌");
     out.put(" ");
     out.paint(Tone::Bold, &wrapped(&clean_title, width, 2));
@@ -698,14 +789,34 @@ pub fn note(kind: NoteKind, message: &str) {
 /// A line led by a one-column mark in its own tone, wrapping beneath its
 /// text: the shape of notes and of flagged list items.
 pub fn marked(mark: &str, mark_tone: Tone, message: &str, tone: Tone) {
+    marked_link(mark, mark_tone, message, tone, "");
+}
+
+/// `marked`, with the text as a hyperlink to `link` where the terminal
+/// shows colour. Returns whether it was linked, so the caller can print
+/// the URL itself otherwise.
+pub fn marked_link(mark: &str, mark_tone: Tone, message: &str, tone: Tone, link: &str) -> bool {
     let content = wrapped(&safe(message), columns(), 4);
     let mut out = Out::new();
+    let linked = out.color && linkable(link);
     out.pad(2);
     out.paint(mark_tone, mark);
     out.put(" ");
+    if linked {
+        out.put(&format!("\x1b]8;;{link}\x1b\\"));
+    }
     out.paint(tone, &content);
+    if linked {
+        out.put("\x1b]8;;\x1b\\");
+    }
     out.put("\n");
     emit(out);
+    linked
+}
+
+/// Only a plain https URL is written into an OSC 8 escape sequence.
+fn linkable(link: &str) -> bool {
+    link.starts_with("https://") && link.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
 /// A problem report on standard error: what failed, then how to proceed.
@@ -721,8 +832,9 @@ pub fn problem(kind: NoteKind, message: &str, hint: &str) {
     if hint.is_empty() {
         return;
     }
+    // The hint says what to do next, so it is plain text, not dimmed.
     let advice = wrapped(&safe(hint), width, 4);
-    eprint(&format!("    {}{}{}\n", on(Tone::Muted), advice, off));
+    eprint(&format!("    {advice}\n"));
 }
 
 pub fn warn(message: &str) {
@@ -1097,9 +1209,8 @@ pub fn entry(e: &Entry) {
     let body = used + 4;
     out.paint(if source == "aur" { Tone::Special } else { Tone::Accent }, &source);
     out.paint(Tone::Muted, "/");
-    // An OSC 8 hyperlink takes no columns. Only a plain https URL is
-    // written into the escape sequence.
-    let linked = out.color && e.link.starts_with("https://") && e.link.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    // An OSC 8 hyperlink takes no columns.
+    let linked = out.color && linkable(&e.link);
     if linked {
         out.put("\x1b]8;;");
         out.put(&e.link);
@@ -1163,6 +1274,22 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// A transient line saying what is under way, such as a clone. The next
+/// output replaces it. Shown only on a live terminal.
+pub fn status(message: &str) {
+    if !caps().live {
+        return;
+    }
+    let mut out = Out::new();
+    out.put("\r\x1b[2K  ");
+    out.paint(Tone::Muted, &clipped(&safe(message), columns().saturating_sub(4)));
+    let mut s = state();
+    begin(&mut s);
+    s.pending.extend_from_slice(out.buf.as_bytes());
+    s.progress_active = true;
+    end(&mut s);
 }
 
 /// A single live status line; a completed step leaves one finished line.
@@ -1310,25 +1437,46 @@ pub fn answer(prompt: &str) -> Result<String> {
     Ok(reply.trim_matches(|c| c == ' ' || c == '\r' || c == '\t').to_string())
 }
 
-fn yes(reply: &str) -> bool {
-    reply.eq_ignore_ascii_case("y") || reply.eq_ignore_ascii_case("yes")
+/// Whether a reply to `prompt` means yes: y or yes, or an empty reply when
+/// the prompt's default is yes ([Y/n]).
+fn yes(prompt: &str, reply: &str) -> bool {
+    reply.eq_ignore_ascii_case("y")
+        || reply.eq_ignore_ascii_case("yes")
+        || (reply.is_empty() && prompt.ends_with("[Y/n]"))
 }
 
+/// Ask until the reply is yes or no, as pacman does, so a typo cannot
+/// cancel a long run. Ok(true) for yes.
+fn ask(prompt: &str) -> Result<bool> {
+    loop {
+        let reply = answer(prompt)?;
+        if yes(prompt, &reply) {
+            return Ok(true);
+        }
+        if reply.is_empty() || reply.eq_ignore_ascii_case("n") || reply.eq_ignore_ascii_case("no") {
+            return Ok(false);
+        }
+        note(NoteKind::Warning, "Answer y or n.");
+    }
+}
+
+/// Ask a yes/no question. Input that ends first counts as no.
 pub fn confirm(prompt: &str) -> bool {
-    answer(prompt).map(|r| yes(&r)).unwrap_or(false)
+    ask(prompt).unwrap_or(false)
 }
 
-/// Ask, and refuse unless the answer is yes. Input that ends first is
-/// ConfirmationRequired, as at any other prompt. Unattended, the answer is yes.
+/// Ask, and refuse unless the answer is yes. A prompt ending in [Y/n] takes
+/// an empty answer as yes. Input that ends first is ConfirmationRequired, as
+/// at any other prompt. Unattended, the answer is yes.
 pub fn require(prompt: &str) -> Result<()> {
     if unattended() {
         assumed(prompt, "yes");
         return Ok(());
     }
-    if yes(&answer(prompt)?) {
+    if ask(prompt)? {
         Ok(())
     } else {
-        Err(Kind::Cancelled.into())
+        Err(Kind::Declined.into())
     }
 }
 
@@ -1373,7 +1521,20 @@ pub fn size_delta(bytes: i64) -> String {
 }
 
 pub fn count(n: usize, singular: &str, plural: &str) -> String {
-    format!("{} {}", n, if n == 1 { singular } else { plural })
+    format!("{} {}", grouped(n), if n == 1 { singular } else { plural })
+}
+
+/// A number with its thousands grouped: 492,103.
+pub fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// Civil date (year, month, day) and time of day for a Unix timestamp in UTC.
@@ -1452,6 +1613,14 @@ mod tests {
     }
 
     #[test]
+    fn counts_group_thousands() {
+        assert_eq!(count(1, "file", "files"), "1 file");
+        assert_eq!(count(999, "file", "files"), "999 files");
+        assert_eq!(count(492103, "file", "files"), "492,103 files");
+        assert_eq!(grouped(1234567), "1,234,567");
+    }
+
+    #[test]
     fn remote_metadata_cannot_inject_terminal_escapes() {
         assert_eq!("abc [31m xyz ", safe("abc\x1b[31m\nxyz\x7f"));
         // C1 controls include an 8-bit CSI that some terminals honour.
@@ -1465,15 +1634,17 @@ mod tests {
     }
 
     #[test]
-    fn terminal_wrapping_preserves_words_long_tokens_and_utf8() {
+    fn terminal_wrapping_keeps_words_whole_and_utf8_intact() {
         let _g = test_lock();
         for (input, width, indent, expected) in [
             ("one two three", 11, 4, "one two\n    three"),
             ("one two three", 12, 4, "one two\n    three"),
-            ("abcdefghij", 8, 2, "abcdef\n  ghij"),
+            // A path longer than the line stays whole, so it can be copied.
+            ("abcdefghij", 8, 2, "abcdefghij"),
+            ("see /a/long/path ok", 8, 2, "see\n  /a/long/path\n  ok"),
             ("café café", 7, 2, "café\n  café"),
             ("  one   two  ", 10, 2, "one\n  two"),
-            ("abc", 2, 4, "a\n    b\n    c"),
+            ("abc", 2, 4, "abc"),
             ("", 80, 4, ""),
         ] {
             assert_eq!(expected, wrapped(input, width, indent), "{input:?} at {width}");

@@ -14,6 +14,14 @@ pub fn repository(p: &Pkg) -> &str {
     p.db_name()
 }
 
+/// Set when input ended at a provider prompt, so the caller stops instead
+/// of taking "no provider" as the answer.
+static PROVIDER_ABANDONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn provider_abandoned() -> bool {
+    PROVIDER_ABANDONED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn explicit(p: &Pkg) -> bool {
     p.explicit()
 }
@@ -255,23 +263,23 @@ impl libalpm::Frontend for Callbacks {
         }
     }
 
-    /// Every question defaults to "no". Unattended, the yes/no questions get
-    /// pacman's --noconfirm answer and a provider choice the first provider.
-    /// Questions without a case here, such as skipping unresolvable targets or
-    /// deleting corrupted files, stay "no".
+    /// Each yes/no prompt's default (on Enter) is pacman's --noconfirm answer,
+    /// which is also the answer when unattended; a provider choice defaults to
+    /// the first provider. Questions without a case here, such as skipping
+    /// unresolvable targets or deleting corrupted files, stay "no".
     fn question(&self, q: &mut Question) {
         match q {
             Question::InstallIgnorePkg { pkg, install } => {
                 ui::note(ui::NoteKind::Warning, &format!("{} is listed in IgnorePkg.", pkg.name));
-                *install = ask("Install it anyway? [y/N]", true);
+                *install = ask("Install it anyway? [Y/n]", true);
             }
             Question::Replace { old, new, replace, .. } => {
                 ui::note(ui::NoteKind::Warning, &format!("{} replaces {}.", new.name, old.name));
-                *replace = ask("Approve the replacement? [y/N]", true);
+                *replace = ask("Approve the replacement? [Y/n]", true);
             }
             Question::Conflict { package1, package2, remove, .. } => {
                 ui::note(ui::NoteKind::Warning, &format!("{package1} conflicts with {package2}."));
-                *remove = ask("Remove the conflicting installed package? [y/N]", false);
+                *remove = ask(&format!("Remove {package2}? [y/N]"), false);
             }
             Question::SelectProvider { depend, providers, use_index } => {
                 ui::heading("Choose a provider", &depend.to_string());
@@ -285,27 +293,33 @@ impl libalpm::Frontend for Callbacks {
                     });
                 }
                 if ui::unattended() {
-                    ui::assumed("Provider [1]:", "1");
+                    ui::assumed(&format!("Enter a number 1-{} (default 1):", providers.len()), "1");
                     *use_index = 0;
                     return;
                 }
-                let Ok(reply) = ui::answer("Provider [1]:") else {
-                    *use_index = -1;
-                    return;
+                // Ask again until the reply is in range; ended input cancels.
+                *use_index = loop {
+                    let Ok(reply) = ui::answer(&format!("Enter a number 1-{} (default 1):", providers.len())) else {
+                        PROVIDER_ABANDONED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break -1;
+                    };
+                    let index = if reply.is_empty() { 1 } else { reply.parse::<usize>().unwrap_or(0) };
+                    if index > 0 && index <= providers.len() {
+                        break index as i32 - 1;
+                    }
+                    ui::note(ui::NoteKind::Warning, &format!("Choose a number from 1 to {}.", providers.len()));
                 };
-                let index = if reply.is_empty() { 1 } else { reply.parse::<usize>().unwrap_or(0) };
-                *use_index = if index > 0 && index <= providers.len() { index as i32 - 1 } else { -1 };
             }
             Question::ImportKey { fingerprint, uid, import } => {
                 ui::note(ui::NoteKind::Warning, &format!("Signing key {fingerprint} ({uid}) is not in the keyring."));
-                *import = ask("Import and trust this key for package verification? [y/N]", true);
+                *import = ask("Import and trust this key for package verification? [Y/n]", true);
             }
             // zap never deletes cache files itself; it names the file so the
             // user can remove it and run again for a fresh download.
             Question::CorruptedPkg { filepath, remove } => {
                 ui::note(
                     ui::NoteKind::Failure,
-                    &format!("{filepath} does not match the repository. Delete it and run zap again to download it fresh."),
+                    &format!("{filepath} does not match the repository. Delete it as root, for example with sudo rm {filepath}, and run zap again to download it fresh."),
                 );
                 *remove = false;
             }
@@ -342,15 +356,28 @@ impl libalpm::Frontend for Callbacks {
             return;
         }
         let label = match kind {
+            Progress::Download if percent >= 100 => "Downloaded",
+            Progress::Download => "Downloading",
+            // A finished step reads in the past tense, as a finished download does.
+            Progress::AddStart if percent >= 100 => "Installed",
             Progress::AddStart => "Installing",
+            Progress::UpgradeStart if percent >= 100 => "Upgraded",
             Progress::UpgradeStart => "Upgrading",
+            Progress::DowngradeStart if percent >= 100 => "Downgraded",
             Progress::DowngradeStart => "Downgrading",
+            Progress::ReinstallStart if percent >= 100 => "Reinstalled",
             Progress::ReinstallStart => "Reinstalling",
+            Progress::RemoveStart if percent >= 100 => "Removed",
             Progress::RemoveStart => "Removing",
+            Progress::ConflictsStart if percent >= 100 => "Checked conflicts",
             Progress::ConflictsStart => "Checking conflicts",
+            Progress::DiskspaceStart if percent >= 100 => "Checked disk space",
             Progress::DiskspaceStart => "Checking disk space",
+            Progress::IntegrityStart if percent >= 100 => "Verified packages",
             Progress::IntegrityStart => "Verifying packages",
+            Progress::LoadStart if percent >= 100 => "Loaded packages",
             Progress::LoadStart => "Loading packages",
+            Progress::KeyringStart if percent >= 100 => "Checked keyring",
             Progress::KeyringStart => "Checking keyring",
         };
         ui::progress(label, name, percent.max(0) as usize, current, total);

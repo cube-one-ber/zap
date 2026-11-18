@@ -53,7 +53,7 @@ fn overview() {
     ));
     ui::text("A native Arch Linux and AUR helper", 2, Tone::Muted);
     ui::blank();
-    ui::text("zap <command> [targets] [options]", 2, Tone::Plain);
+    ui::text("zap [OPTIONS] COMMAND [TARGETS] [OPTIONS]", 2, Tone::Plain);
 
     let syntax_width = SPECS.iter().map(|e| ui::display_width(&syntax(e))).max().unwrap_or(0);
     let alias_width = SPECS.iter().map(|e| ui::display_width(e.alias)).max().unwrap_or(0);
@@ -77,7 +77,7 @@ fn overview() {
     }
 
     ui::blank();
-    ui::note(NoteKind::Info, "zap help <command> shows one command's usage, options and examples.");
+    ui::note(NoteKind::Info, "zap help COMMAND shows one command's usage, options and examples.");
     ui::note(NoteKind::Info, "Build files run as your user only after you review them; system changes go through run0 or sudo and need a final confirmation, unless you pass --noconfirm.");
     ui::blank();
 }
@@ -88,7 +88,7 @@ fn command_page(entry: &Spec) {
     ui::text(entry.summary, 2, Tone::Plain);
     if !entry.about.is_empty() {
         ui::blank();
-        ui::text(entry.about, 2, Tone::Muted);
+        ui::text(entry.about, 2, Tone::Plain);
     }
 
     let accepted = || OPTIONS.iter().filter(|c| c.commands.contains(entry.command));

@@ -10,10 +10,19 @@ use crate::aur::{self, Package};
 use crate::cli::{Reason, Scope, SearchBy};
 use crate::errors::{self, Kind, Result};
 use crate::libalpm::{self, vercmp, Pkg};
+use crate::query;
 use crate::srcinfo::{self, Metadata};
 use crate::transaction::{self, Operation, Request, Target};
 use crate::ui::{self, Cell, Column, NoteKind, Table, Tone};
 use crate::util::{self, append_unique, contains, dep_name, join, valid_name};
+
+/// Set once AUR build files are cloned or updated in the build cache, which
+/// even a dry run does to read them.
+static SOURCES_FETCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn sources_fetched() -> bool {
+    SOURCES_FETCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
 use crate::sandbox;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -57,10 +66,16 @@ pub struct Builder<'a> {
     pub scope: Scope,
     /// Requested names that must come from the AUR even if a repository has them.
     pub aur_targets: Vec<String>,
+    /// The targets are the update list, not names the user typed.
+    pub updating: bool,
+    /// The repository packages were upgraded before the AUR builds.
+    pub repos_upgraded: bool,
     pub needed: bool,
     pub sandbox: bool,
     pub clean_after: bool,
     pub rebuild_tree: bool,
+    /// `build` and `build-local`: build without installing anything.
+    pub build_only: bool,
     pub reason: Option<Reason>,
     nodes: Vec<Node>,
     /// Indices into `nodes`, dependencies before dependants.
@@ -68,6 +83,8 @@ pub struct Builder<'a> {
     repos: Vec<Target>,
     reason_targets: Vec<Target>,
     explicit_names: Vec<String>,
+    /// (chosen, requested) for requested names another package provides.
+    provides: Vec<(String, String)>,
 }
 
 impl<'a> Builder<'a> {
@@ -80,16 +97,20 @@ impl<'a> Builder<'a> {
             preserve_reasons: false,
             scope: Scope::All,
             aur_targets: Vec::new(),
+            updating: false,
+            repos_upgraded: false,
             needed: false,
             sandbox: true,
             clean_after: false,
             rebuild_tree: false,
+            build_only: false,
             reason: None,
             nodes: Vec::new(),
             order: Vec::new(),
             repos: Vec::new(),
             reason_targets: Vec::new(),
             explicit_names: Vec::new(),
+            provides: Vec::new(),
         }
     }
 
@@ -126,7 +147,8 @@ impl<'a> Builder<'a> {
 
     // ── Planning ────────────────────────────────────────────────────────────
 
-    /// Resolve every requested package and its dependencies, then show the plan.
+    /// Resolve every requested package and its dependencies, then show the
+    /// plan. A build-only plan that could not build is refused before it is shown.
     pub fn plan(&mut self) -> Result<()> {
         for index in 0..self.nodes.len() {
             if self.nodes[index].local_source {
@@ -140,11 +162,13 @@ impl<'a> Builder<'a> {
         if !self.nodes.is_empty() {
             self.resolve("base-devel", false, 0)?;
         }
-        self.show_plan();
-        Ok(())
+        if self.build_only {
+            self.require_installed_dependencies()?;
+        }
+        self.show_plan()
     }
 
-    fn show_plan(&self) {
+    fn show_plan(&self) -> Result<()> {
         let builds: usize = self.order.iter().map(|&i| self.nodes[i].wanted.len()).sum();
         let mut parts = Vec::new();
         if !self.repos.is_empty() {
@@ -156,8 +180,10 @@ impl<'a> Builder<'a> {
         if !self.reason_targets.is_empty() {
             parts.push(ui::count(self.reason_targets.len(), "reason change", "reason changes"));
         }
+        // Every target was skipped by --needed, and each already said so.
         if parts.is_empty() {
-            return ui::note(NoteKind::Success, "Nothing to do.");
+            crate::commands::nothing_to_do();
+            return Ok(());
         }
 
         ui::heading("Plan", &parts.join(" · "));
@@ -177,7 +203,7 @@ impl<'a> Builder<'a> {
             let old = self.db.installed_pkg(&target.name);
             download += self.db.h.download_size(&p);
             growth += p.info().isize - old.map_or(0, |previous| previous.info().isize);
-            if plan_row(&mut table, &target.name, old.map(|o| &**o), &p.version, alpm::repository(&p), !target.dependency) {
+            if plan_row(&mut table, &target.name, old.map(|o| &**o), &p.version, alpm::repository(&p), &self.reason(&target.name, !target.dependency), false) {
                 reinstalls.push(&target.name);
             }
         }
@@ -188,40 +214,83 @@ impl<'a> Builder<'a> {
                 let split = *wanted != node.package.PackageBase;
                 let source = if split { format!("{origin} · base {}", node.package.PackageBase) } else { origin.to_string() };
                 let old = self.db.installed_pkg(wanted).map(|o| &**o);
-                if plan_row(&mut table, wanted, old, &node.package.Version, &source, contains(&self.explicit_names, wanted)) {
+                if plan_row(&mut table, wanted, old, &node.package.Version, &source, &self.reason(wanted, contains(&self.explicit_names, wanted)), self.build_only) {
                     reinstalls.push(wanted);
                 }
             }
         }
         table.render();
         ui::blank();
-        if !self.repos.is_empty() {
-            ui::field("Download", &if download == 0 { "nothing: already in the package cache".to_string() } else { ui::size(download) });
-            ui::field("Disk space", &if growth == 0 { "no change".to_string() } else { format!("{} for repository packages", ui::size_delta(growth)) });
-            ui::note(NoteKind::Info, "Repository dependencies, conflicts and replacements are settled in the final transaction, which you confirm separately.");
+        // build only builds, so nothing installed is replaced.
+        let conflicts = if self.build_only { Vec::new() } else { self.aur_conflicts() };
+        // Unattended, the removal question is answered no: fail now, not after the build.
+        if let (Some((new, old)), true) = (conflicts.first(), ui::unattended()) {
+            let hint = format!("--noconfirm never removes installed packages. Remove {old} first, or run without --noconfirm.");
+            return Err(errors::with_hint(Kind::UnattendedConflict, hint, format!("{new} conflicts with {old}")));
         }
-        if builds > 0 {
-            if self.sandbox {
-                ui::note(NoteKind::Info, "Packages to build are reviewed, then built in a sandbox and sized before anything is installed.");
-            } else {
-                ui::note(NoteKind::Warning, "Sandbox disabled: approved build code will run with your user's full permissions.");
+        // Summary fields, then notes, then warnings.
+        if !self.repos.is_empty() {
+            ui::field("Download", &if download == 0 { "nothing: already in the package cache".to_string() } else { format!("{} for the repository packages listed", ui::size(download)) });
+            ui::field("Disk space", &if growth == 0 { "no change".to_string() } else { format!("{} for the repository packages listed", ui::size_delta(growth)) });
+            ui::note(NoteKind::Info, "Dependencies of these repository packages appear in the final transaction, before you confirm.");
+        }
+        let build_deps: Vec<&str> = self.repos.iter().filter(|t| t.dependency && self.build_only(&t.name)).map(|t| t.name.as_str()).collect();
+        if !build_deps.is_empty() {
+            ui::note(NoteKind::Info, &format!("Only builds need {}; zap autoremove removes {} afterwards.", build_deps.join(", "), if build_deps.len() == 1 { "it" } else { "them" }));
+        }
+        // The sandbox is the default, so only its absence is worth a line.
+        if builds > 0 && !self.sandbox {
+            ui::note(NoteKind::Warning, "Sandbox disabled: approved build code will run with your user's full permissions.");
+        }
+        // An AUR build in place of a repository package changes where updates come from.
+        for &index in &self.order {
+            for wanted in &self.nodes[index].wanted {
+                let from = self.db.installed_pkg(wanted).and_then(|_| self.db.h.syncdbs.iter().find(|d| d.get(wanted).is_some()));
+                if let (Some(repo), false) = (from, self.nodes[index].local_source) {
+                    ui::note(NoteKind::Warning, &format!("{wanted} is installed from {}; this replaces it with the AUR build.", repo.name));
+                }
             }
         }
         for target in &self.reason_targets {
             let reason = reason_name(target.reason.unwrap_or(Reason::Explicit));
             ui::note(NoteKind::Info, &format!("{} is already current; it will be marked {reason}.", target.name));
         }
+        for (new, old) in conflicts {
+            ui::note(NoteKind::Warning, &format!("{new} conflicts with the installed {old}; zap will ask to remove {old} after the build (default: no)."));
+        }
         if !reinstalls.is_empty() {
             let subject = if reinstalls.len() == 1 { format!("{} is", reinstalls[0]) } else { ui::count(reinstalls.len(), "package is", "packages are") };
             ui::note(NoteKind::Warning, &format!("{subject} already installed at this version. Add --needed to skip current packages."));
         }
-        ui::blank();
+        ui::separate();
+        Ok(())
+    }
+
+    /// Installed packages that a package to build conflicts with, as
+    /// (package to build, installed package). The transaction asks to
+    /// remove them; the plan says so before anything is reviewed or built.
+    fn aur_conflicts(&self) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for &index in &self.order {
+            let node = &self.nodes[index];
+            for conflict in &node.package.Conflicts {
+                let dep = libalpm::deps::Depend::parse(conflict);
+                for p in self.db.installed() {
+                    if !contains(&node.wanted, &p.name) && dep.satisfied_by(p) {
+                        found.push((node.package.Name.clone(), p.name.clone()));
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// `--needed`: leave a current package alone, but still honour a
     /// requested change of installation reason.
     fn skip_installed(&mut self, name: &str, version: &str, installed_reason: libalpm::Reason) {
+        ui::separate();
         ui::note(NoteKind::Success, &format!("{name} {version} is already installed and current."));
+        ui::blank();
         let reason = self.reason.unwrap_or(Reason::Explicit);
         let desired = if reason == Reason::Explicit { libalpm::Reason::Explicit } else { libalpm::Reason::Depend };
         if installed_reason != desired {
@@ -284,8 +353,13 @@ impl<'a> Builder<'a> {
 
         let from_aur = explicit && (self.scope == Scope::Aur || contains(&self.aur_targets, dep_name(dep)));
         if !from_aur {
-            if let Some(p) = self.db.repo(dep) {
+            let found = self.db.repo(dep);
+            if alpm::provider_abandoned() {
+                return errors::fail(Kind::ConfirmationRequired);
+            }
+            if let Some(p) = found {
                 if explicit {
+                    self.provided_by(dep, &p.name, "the repositories");
                     append_unique(&mut self.explicit_names, &p.name);
                     if self.needed {
                         if let Some((version, reason)) = self.current(&p.name, &p.version) {
@@ -317,7 +391,34 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
 
-        let p = choose_aur(dep)?;
+        let p = match choose_aur(dep) {
+            // A requested name that nothing provides is most likely a typo.
+            Err(e) if explicit && e.kind == Kind::UnsatisfiedDependency => {
+                let aur_only = self.scope == Scope::Aur || contains(&self.aur_targets, dep_name(dep));
+                let kind = if aur_only { Kind::AurPackageNotFound } else { Kind::PackageNotFound };
+                // pacman -S takes a group name; zap takes packages.
+                let group = self.db.h.syncdbs.iter().any(|d| d.pkgs().iter().any(|p| p.info().groups.iter().any(|g| g == dep)));
+                if group {
+                    let hint = format!("{dep} is a package group; zap installs packages by name. List its members with pacman -Sg {dep}, or run pacman -S {dep}.");
+                    return Err(errors::with_hint(kind, hint, dep));
+                }
+                return Err(lowercase_hint(self.db, errors::with(kind, dep), dep));
+            }
+            result => result?,
+        };
+        // aur/NAME and --aur NAME ask for that exact package, not one that
+        // provides it.
+        let exact = contains(&self.aur_targets, dep_name(dep)) || (self.scope == Scope::Aur && !self.updating);
+        if explicit && p.Name != dep_name(dep) && exact {
+            let mut hint = format!("{} provides it: zap install aur/{}", p.Name, p.Name);
+            if let Some(repo) = self.db.repo(dep_name(dep)) {
+                hint.push_str(&format!(". {} itself is in {}: zap install {}.", dep_name(dep), alpm::repository(&repo), dep_name(dep)));
+            }
+            return Err(errors::with_hint(Kind::AurPackageNotFound, hint, dep));
+        }
+        if explicit {
+            self.provided_by(dep, &p.Name, "the AUR");
+        }
         if explicit && self.needed {
             if let Some((version, reason)) = self.current(&p.Name, &p.Version) {
                 self.skip_installed(&p.Name, &version, reason);
@@ -335,7 +436,7 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
 
-        let dir = self.checkout(&p.PackageBase, true)?;
+        let dir = self.checkout(&p.PackageBase, false)?;
         let meta = self.read_srcinfo(&dir)?;
         // The checkout must be the package the RPC described.
         if meta.base != p.PackageBase || !contains(&meta.names, &p.Name) || !meta.matches(dep, &p.Name) {
@@ -371,7 +472,8 @@ impl<'a> Builder<'a> {
     pub fn load_local<S: AsRef<str>>(&mut self, dirs: &[S]) -> Result<()> {
         for input in dirs {
             let input = input.as_ref();
-            let source = std::fs::canonicalize(input).map_err(|e| errors::with(e, input))?.to_string_lossy().into_owned();
+            let source = std::fs::canonicalize(input)
+                .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { errors::with_hint(Kind::FileNotFound, "zap builds a local directory that contains a PKGBUILD.", input) } else { errors::with(e, input) })?.to_string_lossy().into_owned();
             let mut template = util::cstr(&join(&self.root, ".local-XXXXXX")).into_bytes_with_nul();
             if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() {
                 return errors::fail(Kind::StagingFailed);
@@ -445,10 +547,12 @@ impl<'a> Builder<'a> {
     /// changed since the cached copy when `announce` is set. No package code
     /// runs here.
     fn checkout(&self, base: &str, announce: bool) -> Result<String> {
+        SOURCES_FETCHED.store(true, std::sync::atomic::Ordering::Relaxed);
         let dir = join(&self.root, base);
         let url = format!("https://aur.archlinux.org/{base}.git");
         match std::fs::symlink_metadata(&dir) {
             Err(_) => {
+                ui::status(&format!("Fetching {base} from the AUR…"));
                 git(&["clone", "--", &url, &dir], None)?;
                 util::secure_dir(&dir)?;
             }
@@ -460,13 +564,14 @@ impl<'a> Builder<'a> {
                     return Err(errors::with(Kind::ModifiedBuildFiles, &dir));
                 }
                 let before = git_line(&["rev-parse", "HEAD"], &dir)?;
+                ui::status(&format!("Checking the AUR for changes to {base}…"));
                 git(&["fetch", "--", &url, "master"], Some(&dir))?;
                 git(&["merge", "--ff-only", "FETCH_HEAD"], Some(&dir))?;
                 let approved = git_line(&["for-each-ref", "--format=%(objectname)", APPROVED_REF], &dir)?;
                 let head = git_line(&["rev-parse", "HEAD"], &dir)?;
                 let baseline = if approved.is_empty() { &before } else { &approved };
                 if announce && *baseline != head {
-                    let diff = git(&["diff", "--no-ext-diff", "--no-textconv", baseline, &head, "--"], Some(&dir))?;
+                    let diff = ordered_diff(&dir, baseline, &head)?;
                     if !diff.is_empty() {
                         let since = if approved.is_empty() { "your cached copy" } else { "you last approved it" };
                         ui::rule(&format!("{base} · changes since {since}"));
@@ -531,15 +636,51 @@ impl<'a> Builder<'a> {
             // start is an error; it never falls back to an unsandboxed build.
             let probe = self.makepkg_args(&self.nodes[self.order[0]].dir, &["/usr/bin/true"]).map_err(|_| Kind::BuildSandboxUnavailable)?;
             util::run(&probe, None).map_err(|_| Kind::BuildSandboxUnavailable)?;
-            ui::note(NoteKind::Info, "Builds run in a sandbox: private home, read-only system and package database, network for downloads only.");
-        } else if !self.order.is_empty() {
-            ui::note(NoteKind::Warning, "Sandbox disabled: approved build code runs with your user's full permissions.");
         }
 
         // Every base is reviewed before any PKGBUILD code runs or the system changes.
         let total = self.order.len();
         for (step, &index) in self.order.iter().enumerate() {
-            review(&mut self.nodes[index], step + 1, total)?;
+            let node = &mut self.nodes[index];
+            match review(node, step + 1, total) {
+                Err(e) if e.kind == Kind::Declined => {
+                    // The path to its build files was shown just above the prompt.
+                    let base = node.package.PackageBase.clone();
+                    let mut hint = if self.repos_upgraded {
+                        format!("{base} was not approved, so no AUR package was built. The repository upgrade above is complete.")
+                    } else {
+                        format!("{base} was not approved, so nothing was built or installed.")
+                    };
+                    // Name the other requested packages, so declining one does
+                    // not lose them; installed dependencies stay dependencies.
+                    let (mut plain, mut deps) = (Vec::new(), Vec::new());
+                    // Not those that need the declined base: their review would bring it back.
+                    let declined = &self.nodes[index].metadata;
+                    let needs_declined = |m: &Metadata| m.deps.iter().any(|d| contains(&declined.names, dep_name(d)) || declined.provides.iter().any(|p| dep_name(p) == dep_name(d)));
+                    for &i in &self.order {
+                        let node = &self.nodes[i];
+                        if needs_declined(&node.metadata) {
+                            continue;
+                        }
+                        for name in node.wanted.iter().filter(|w| node.package.PackageBase != base && contains(&self.explicit_names, w)) {
+                            let dependency = self.preserve_reasons && self.db.local(name).is_some_and(|old| !alpm::explicit(old));
+                            if dependency { &mut deps } else { &mut plain }.push(name.as_str());
+                        }
+                    }
+                    let mut commands = Vec::new();
+                    if !plain.is_empty() {
+                        commands.push(format!("zap install {}", plain.join(" ")));
+                    }
+                    if !deps.is_empty() {
+                        commands.push(format!("zap install --asdeps {}", deps.join(" ")));
+                    }
+                    if !commands.is_empty() {
+                        hint.push_str(&format!(" To build the others: {}", commands.join(", then ")));
+                    }
+                    return Err(errors::with_hint(Kind::Declined, hint, base));
+                }
+                result => result?,
+            }
         }
 
         // Sourcing the PKGBUILD is the first execution of package code. The
@@ -570,16 +711,17 @@ impl<'a> Builder<'a> {
     }
 
     /// `build` changes nothing on the system, so everything must be in place.
-    pub fn require_installed_dependencies(&self) -> Result<()> {
+    fn require_installed_dependencies(&self) -> Result<()> {
+        if let Some(target) = self.repos.iter().find(|t| !t.dependency) {
+            let hint = format!("Only AUR packages are built. Run zap install {} instead.", target.name);
+            return Err(errors::with_hint(Kind::BuildRequiresAurPackage, hint, &target.name));
+        }
         if self.nodes.is_empty() {
             return errors::fail(Kind::BuildRequiresAurPackage);
         }
         for target in &self.repos {
             if self.db.local(&target.name).is_none() {
                 return Err(errors::with(Kind::MissingBuildDependencies, &target.name));
-            }
-            if !target.dependency {
-                return Err(errors::with(Kind::BuildRequiresAurPackage, format!("{} is a repository package", target.name)));
             }
         }
         for node in &self.nodes {
@@ -624,7 +766,12 @@ impl<'a> Builder<'a> {
             }
         }
         if install {
-            transaction::escalate(&Request { targets: built.targets, needed: self.needed, ..Request::new(Operation::Install) })?;
+            let archives: Vec<String> = built.targets.iter().filter_map(|t| t.archive.clone()).collect();
+            // A declined or failed install should not throw a long build away.
+            if let Err(e) = transaction::escalate(&Request { targets: built.targets, needed: self.needed, ..Request::new(Operation::Install) }) {
+                ui::note(NoteKind::Info, &format!("The built packages are kept. To install them later: zap install-files {}", archives.join(" ")));
+                return Err(e);
+            }
             self.db.reload()?;
         }
         // makepkg may rewrite a literal pkgver after a VCS build. Only that
@@ -636,6 +783,35 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// Say so when a requested name is satisfied by a package of another
+    /// name, and remember it for the plan's Reason column.
+    fn provided_by(&mut self, requested: &str, chosen: &str, source: &str) {
+        let requested = dep_name(requested);
+        if requested != chosen {
+            ui::note(NoteKind::Warning, &format!("{requested} is not a package in {source}; {chosen} provides it."));
+            self.provides.push((chosen.to_string(), requested.to_string()));
+        }
+    }
+
+    /// A plan row's Reason: what was asked for, or why it is needed.
+    fn reason(&self, name: &str, requested: bool) -> String {
+        match self.provides.iter().find(|(chosen, _)| chosen == name) {
+            Some((_, asked)) => format!("provides {asked}"),
+            None if requested && self.updating => "update".into(),
+            None if requested => "requested".into(),
+            None if self.build_only(name) => "build dependency".into(),
+            None => "dependency".into(),
+        }
+    }
+
+    /// Whether a package in the plan is only a make or check dependency, so
+    /// it is left behind as an orphan once the builds are done.
+    fn build_only(&self, name: &str) -> bool {
+        let names = |deps: &[String]| deps.iter().any(|d| dep_name(d) == name);
+        let nodes = || self.order.iter().map(|&i| &self.nodes[i].metadata);
+        nodes().any(|m| names(&m.build_deps)) && !nodes().any(|m| m.deps.iter().any(|d| dep_name(d) == name && !contains(&m.build_deps, d)))
+    }
+
     // ── Cache ───────────────────────────────────────────────────────────────
 
     /// `clean`: delete the named package bases, or the whole cache.
@@ -643,17 +819,46 @@ impl<'a> Builder<'a> {
         if let Some(base) = self.requested.iter().find(|base| !valid_name(base)) {
             return Err(errors::with(Kind::InvalidPackageName, base));
         }
-        if self.requested.is_empty() {
-            ui::heading("Clean build cache", "everything");
-            ui::line(&self.root, 2, Tone::Plain);
-        } else {
-            ui::heading("Clean build cache", &ui::count(self.requested.len(), "package base", "package bases"));
-            for base in &self.requested {
-                ui::line(&join(&self.root, base), 2, Tone::Plain);
+        let cached: Vec<String> = std::fs::read_dir(&self.root)?
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name != ".lock")
+            .collect();
+        let missing: Vec<&str> = self.requested.iter().filter(|base| !cached.contains(base)).map(|m| m.as_str()).collect();
+        // As with pacman, one missing target fails the command before anything is deleted.
+        if !missing.is_empty() {
+            let present: Vec<&str> = self.requested.iter().filter(|b| cached.contains(b)).map(String::as_str).collect();
+            if present.is_empty() {
+                return Err(errors::with(Kind::NotInBuildCache, missing.join(", ")));
             }
+            let (list, verb) = (present.join(" "), if present.len() == 1 { "is" } else { "are" });
+            let hint = format!("{} {verb} cached: zap clean {list} cleans only that.", present.join(", "));
+            return Err(errors::with_hint(Kind::NotInBuildCache, hint, missing.join(", ")));
         }
+        let bases: Vec<&String> = if self.requested.is_empty() { cached.iter().collect() } else { self.requested.iter().collect() };
+        if bases.is_empty() {
+            crate::commands::nothing_to_do();
+            ui::note(NoteKind::Success, "Nothing to clean.");
+            return Ok(());
+        }
+        let mut sizes: Vec<(&String, u64)> = bases.iter().map(|base| (*base, disk_usage(&std::path::Path::new(&self.root).join(base)))).collect();
+        sizes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let total: u64 = sizes.iter().map(|(_, size)| size).sum();
+        let scope = if self.requested.is_empty() { "everything".to_string() } else { ui::count(bases.len(), "package base", "package bases") };
+        ui::heading("Clean build cache", &scope);
+        ui::field("Location", &ui::home_path(&self.root));
+        let mut table = Table::new(&[Column::new("Base").tone(Tone::Bold), Column::new("Size").right()]);
+        for (base, size) in &sizes {
+            // .sync holds zap's snapshot of the repository databases.
+            let label = if base.as_str() == ".sync" { ".sync (repository database snapshot)" } else { base.as_str() };
+            table.add_text(&[label, &ui::size(*size as i64)]);
+        }
+        table.render();
         ui::blank();
+        ui::note(NoteKind::Info, &format!("Frees {}.", ui::size(total as i64)));
+        // The approval baseline lives in each base's clone.
+        ui::note(NoteKind::Info, "The next review of a cleaned package shows every file in full, not the changes since you approved it.");
         if dry {
+            ui::blank();
             return Ok(());
         }
         ui::require("Delete these cached sources and build outputs? [y/N]")?;
@@ -680,6 +885,16 @@ impl<'a> Builder<'a> {
     }
 }
 
+/// Bytes used under `path`, without following links. Unreadable entries count as empty.
+fn disk_usage(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return 0 };
+    if !meta.is_dir() {
+        return meta.blocks() * 512;
+    }
+    let children = std::fs::read_dir(path).into_iter().flatten().flatten();
+    meta.blocks() * 512 + children.map(|entry| disk_usage(&entry.path())).sum::<u64>()
+}
+
 fn remove(path: &std::path::Path, dir: bool) -> Result<()> {
     if dir {
         std::fs::remove_dir_all(path)?;
@@ -697,8 +912,10 @@ fn reason_name(reason: Reason) -> &'static str {
 }
 
 /// One plan row. Returns whether it reinstalls the installed version.
-fn plan_row(table: &mut Table, name: &str, old: Option<&Pkg>, version: &str, source: &str, requested: bool) -> bool {
+/// A plan row; `building` marks a package that is built but not installed.
+fn plan_row(table: &mut Table, name: &str, old: Option<&Pkg>, version: &str, source: &str, reason: &str, building: bool) -> bool {
     let (kind, tone) = match old {
+        _ if building => ("build", Tone::Accent),
         Some(previous) => match vercmp(version, &previous.version) {
             1.. => ("upgrade", Tone::Accent),
             ..=-1 => ("downgrade", Tone::Warning),
@@ -714,7 +931,7 @@ fn plan_row(table: &mut Table, name: &str, old: Option<&Pkg>, version: &str, sou
         Cell::maybe(version, same.then_some(Tone::Plain)),
         Cell::toned(kind, tone),
         Cell::toned(source, if source.starts_with("aur") { Tone::Special } else { Tone::Accent }),
-        Cell::new(if requested { "requested" } else { "dependency" }),
+        Cell::new(reason),
     ]);
     kind == "reinstall"
 }
@@ -748,18 +965,34 @@ fn choose_aur(dep: &str) -> Result<Package> {
             name: p.Name.clone(),
             version: p.Version.clone(),
             description: p.Description.clone().unwrap_or_default(),
-            meta: format!("{} · popularity {}", ui::count(p.NumVotes.max(0) as usize, "vote", "votes"), ui::fixed(p.Popularity, 2)),
+            meta: crate::query::votes(p),
             ..ui::Entry::default()
         });
     }
     if ui::unattended() {
-        ui::assumed("Provider number:", "1");
+        ui::assumed(&format!("Enter a number 1-{} (default 1):", providers.len()), "1");
         return Ok(providers.swap_remove(0));
     }
-    let reply = ui::answer("Provider number:")?;
-    match reply.parse::<usize>() {
-        Ok(choice) if (1..=providers.len()).contains(&choice) => Ok(providers.swap_remove(choice - 1)),
-        _ => Err(errors::with(Kind::InvalidProvider, reply)),
+    // As with repository providers, an empty reply takes the first.
+    loop {
+        let reply = ui::answer(&format!("Enter a number 1-{} (default 1):", providers.len()))?;
+        match if reply.is_empty() { Ok(1) } else { reply.parse::<usize>() } {
+            Ok(choice) if (1..=providers.len()).contains(&choice) => return Ok(providers.swap_remove(choice - 1)),
+            _ => ui::note(NoteKind::Warning, &format!("Choose a number from 1 to {}.", providers.len())),
+        }
+    }
+}
+
+
+/// Package names are lowercase: a not-found error for a name typed with
+/// capitals suggests the lowercase name when that package exists.
+pub fn lowercase_hint(db: &Alpm, error: errors::Error, name: &str) -> errors::Error {
+    let lower = name.to_ascii_lowercase();
+    let exists = lower != name && (db.repo(&lower).is_some_and(|p| p.name == lower) || aur::find(&lower).is_ok_and(|p| p.is_some()));
+    if exists {
+        errors::Error { hint: Some(format!("Did you mean {lower}?")), ..error }
+    } else {
+        error
     }
 }
 
@@ -800,7 +1033,8 @@ fn source_digest(dir: &str, strict: bool) -> Result<String> {
             return Err(errors::with(Kind::UnsafeBuildFile, path.as_ref()));
         }
         let file = join(dir, &path);
-        let digest = transaction::hash_source_file(&file)?;
+        // A link or special file is refused as a build file, not an archive.
+        let digest = transaction::hash_source_file(&file).map_err(|e| if e.kind == Kind::UnsafeArchive { errors::with(Kind::UnsafeBuildFile, path.as_ref()) } else { e })?;
         if path == "PKGBUILD" {
             hash.update(normalize_pkgver(&util::read_file(&file, SOURCE_LIMIT)?));
         } else {
@@ -828,7 +1062,7 @@ fn review(node: &mut Node, step: usize, total: usize) -> Result<()> {
         ui::field("Source", &format!("https://aur.archlinux.org/packages/{}", p.Name));
         ui::field("Maintainer", p.Maintainer.as_deref().unwrap_or("none (orphaned)"));
         ui::field("Last modified", &ui::dated(p.LastModified));
-        ui::field("Votes", &format!("{} · popularity {}", p.NumVotes, ui::fixed(p.Popularity, 2)));
+        ui::field("Votes", &query::votes(p));
         if let Some(flagged) = p.OutOfDate {
             ui::note(NoteKind::Warning, &format!("Flagged out of date on {}.", ui::date(flagged)));
         }
@@ -845,15 +1079,15 @@ fn review(node: &mut Node, step: usize, total: usize) -> Result<()> {
         node.reviewed = true;
         return Ok(());
     }
-    let files = git(&["ls-files", "-z"], Some(&node.dir))?;
-    for path in files.split(|&b| b == 0).filter(|p| !p.is_empty()) {
-        let path = String::from_utf8_lossy(path);
-        let content = git(&["show", &format!("HEAD:{path}")], Some(&node.dir))?;
-        ui::rule(&path);
-        print_source(&content);
+    let approved = if node.local_source { String::new() } else { git_line(&["for-each-ref", "--format=%(objectname)", APPROVED_REF], &node.dir)? };
+    ui::paged(|| show_sources(&node.dir, &approved))?;
+    let base = &node.package.PackageBase;
+    // Files identical to an earlier approval default to yes; anything new to you defaults to no.
+    if !approved.is_empty() && approved == git_line(&["rev-parse", "HEAD"], &node.dir)? {
+        ui::require(&format!("Approve {base} again? [Y/n]"))?;
+    } else {
+        ui::require(&format!("These build files can run arbitrary code as your user. Approve {base}? [y/N]"))?;
     }
-    ui::blank();
-    ui::require(&format!("These build files can run arbitrary code as your user. Approve {}? [y/N]", node.package.PackageBase))?;
     verify_source(node)?;
     node.reviewed = true;
     // Later diffs start from what was approved here.
@@ -861,6 +1095,74 @@ fn review(node: &mut Node, step: usize, total: usize) -> Result<()> {
         git(&["update-ref", APPROVED_REF, "HEAD"], Some(&node.dir))?;
     }
     Ok(())
+}
+
+/// Files a review leaves out: .SRCINFO is checked against the PKGBUILD
+/// before anything is built, and .gitignore never runs.
+const UNREVIEWED: [&str; 2] = [".SRCINFO", ".gitignore"];
+
+/// The diff between two versions of the build files in review order, the
+/// PKGBUILD first, as a full review shows them.
+fn ordered_diff(dir: &str, from: &str, to: &str) -> Result<Vec<u8>> {
+    let mut diff = Vec::new();
+    for paths in [&["PKGBUILD"][..], &[".", ":(exclude)PKGBUILD", ":(exclude).SRCINFO", ":(exclude).gitignore"]] {
+        let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", from, to, "--"];
+        args.extend_from_slice(paths);
+        diff.extend(git(&args, Some(dir))?);
+    }
+    Ok(diff)
+}
+
+/// The build files to approve: only what changed when you approved an
+/// earlier version, otherwise every tracked file in full.
+fn show_sources(dir: &str, approved: &str) -> Result<()> {
+    if !approved.is_empty() {
+        let diff = ordered_diff(dir, approved, "HEAD")?;
+        if diff.is_empty() {
+            ui::separate();
+            ui::note(NoteKind::Success, "No changes since you last approved it.");
+            ui::note(NoteKind::Info, "The build files are in:");
+            ui::line(&ui::home_path(dir), 4, Tone::Plain);
+        } else {
+            // Name the approved version, so the range under review is plain.
+            let srcinfo = git(&["show", &format!("{approved}:.SRCINFO")], Some(dir)).ok();
+            let version = srcinfo.and_then(|text| Metadata::parse(&String::from_utf8_lossy(&text), std::env::consts::ARCH).ok()).map(|m| m.version);
+            match version {
+                Some(version) => ui::rule(&format!("changes since {version}, which you approved")),
+                None => ui::rule("changes since you last approved it"),
+            }
+            print_diff(&diff);
+            ui::blank();
+            build_files_at(dir);
+        }
+        ui::blank();
+        return Ok(());
+    }
+    let files = git(&["ls-files", "-z"], Some(dir))?;
+    let mut paths: Vec<_> = files
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(String::from_utf8_lossy)
+        .filter(|p| !UNREVIEWED.contains(&p.as_ref()))
+        .collect();
+    // The PKGBUILD first: it says what everything else is for.
+    paths.sort_by_key(|p| p != "PKGBUILD");
+    for path in paths {
+        let content = git(&["show", &format!("HEAD:{path}")], Some(dir))?;
+        ui::rule(&path);
+        print_source(&content);
+    }
+    ui::blank();
+    build_files_at(dir);
+    ui::blank();
+    Ok(())
+}
+
+/// Where the reviewed build files are, to open in an editor before answering.
+fn build_files_at(dir: &str) {
+    ui::note(NoteKind::Info, ".SRCINFO is not shown: zap checks it against the PKGBUILD before building.");
+    ui::note(NoteKind::Info, "The full build files are in:");
+    ui::line(&ui::home_path(dir), 4, Tone::Plain);
 }
 
 fn trim_end_newlines(content: &[u8]) -> &[u8] {
@@ -934,6 +1236,12 @@ fn normalize_pkgver(bytes: &[u8]) -> Vec<u8> {
 // Local build files are copied to a fresh review snapshot. Git metadata and
 // makepkg work trees are excluded; every other file is tracked for review.
 fn snapshot_local(source: &str, destination: &str) -> Result<()> {
+    // The usual mistakes, said in terms of the user's directory.
+    for (file, hint) in [("PKGBUILD", "Use a directory that holds a PKGBUILD."), (".SRCINFO", "Run makepkg --printsrcinfo > .SRCINFO in that directory first.")] {
+        if !std::fs::symlink_metadata(join(source, file)).is_ok_and(|m| m.is_file()) {
+            return Err(errors::with_hint(Kind::LocalBuildFileMissing, hint, join(source, file)));
+        }
+    }
     let (mut count, mut total) = (0usize, 0u64);
     copy_local_tree(source, destination, "", 0, &mut count, &mut total)?;
     for file in ["PKGBUILD", ".SRCINFO"] {
@@ -950,7 +1258,7 @@ fn copy_local_tree(source: &str, destination: &str, prefix: &str, depth: usize, 
     let dir = join(source, prefix);
     // Refuse a directory that was swapped for a link since it was listed.
     if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
-        return errors::fail(Kind::UnsafeBuildFile);
+        return Err(errors::with(Kind::UnsafeBuildFile, &dir));
     }
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
@@ -963,7 +1271,7 @@ fn copy_local_tree(source: &str, destination: &str, prefix: &str, depth: usize, 
             return errors::fail(Kind::LocalSourceTooLarge);
         }
         if !crate::query::valid_file(&relative) {
-            return errors::fail(Kind::UnsafeBuildFile);
+            return Err(errors::with(Kind::UnsafeBuildFile, join(source, &relative)));
         }
         let (input, output) = (join(source, &relative), join(destination, &relative));
         let kind = entry.file_type()?;
@@ -976,10 +1284,10 @@ fn copy_local_tree(source: &str, destination: &str, prefix: &str, depth: usize, 
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&input)
-                .map_err(|_| Kind::UnsafeBuildFile)?;
+                .map_err(|_| errors::with(Kind::UnsafeBuildFile, &input))?;
             let meta = file.metadata()?;
             if !meta.is_file() {
-                return errors::fail(Kind::UnsafeBuildFile);
+                return Err(errors::with(Kind::UnsafeBuildFile, &input));
             }
             let mut bytes = Vec::new();
             Read::by_ref(&mut file).take(SOURCE_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
@@ -993,7 +1301,7 @@ fn copy_local_tree(source: &str, destination: &str, prefix: &str, depth: usize, 
             let mut out = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600 | (meta.mode() & 0o111)).open(&output)?;
             out.write_all(&bytes)?;
         } else {
-            return errors::fail(Kind::UnsafeBuildFile);
+            return Err(errors::with(Kind::UnsafeBuildFile, &input));
         }
     }
     Ok(())

@@ -62,10 +62,11 @@ pub enum Question<'a> {
     RemovePkgs { skip: bool },
 }
 
-// Named after libalpm's ALPM_PROGRESS_*_START.
-#[allow(clippy::enum_variant_names)]
+// Named after libalpm's ALPM_PROGRESS_*_START, except Download, which stands
+// in for libalpm's separate download callback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
+    Download,
     AddStart,
     UpgradeStart,
     DowngradeStart,

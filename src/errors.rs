@@ -7,6 +7,8 @@ use std::fmt;
 pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_CANCELLED: u8 = 130;
+/// Between the root worker and zap only: the user answered no.
+pub const EXIT_WORKER_DECLINED: u8 = 3;
 
 pub struct Report {
     pub message: &'static str,
@@ -31,29 +33,31 @@ macro_rules! kinds {
 
 kinds! {
     // Command line.
+    PartialUpgrade => ("Partial upgrades are not supported", "Run zap upgrade (-Syu) to refresh and upgrade.", true, false),
     UnknownCommand => ("Unknown command", "Run zap help to list every command.", true, false),
-    UnknownOption => ("Unknown option", "Run zap help <command> to list the options a command accepts.", true, false),
-    OptionNotValidForCommand => ("Option does not apply to this command", "Run zap help <command> to list the options a command accepts.", true, false),
-    ConflictingOptions => ("Options contradict each other", "", true, false),
+    CommandRequired => ("Missing command", "Options go with a command, as in zap search ripgrep --aur. Run zap help to list every command.", true, false),
+    UnknownOption => ("Unknown option", "Run zap help COMMAND to list the options a command accepts.", true, false),
+    OptionNotValidForCommand => ("Option does not apply to this command", "Run zap help COMMAND to list the options a command accepts.", true, false),
+    ConflictingOptions => ("Options contradict each other", "Pass only one of them.", true, false),
     OptionValueRequired => ("Option needs a value", "", true, false),
     OptionValueNotAllowed => ("Option does not take a value", "", true, false),
     InvalidSearchField => ("Unknown search field", "Use name, name-desc, maintainer, provides, depends, makedepends, checkdepends or optdepends.", true, false),
     InvalidSortField => ("Unknown sort order", "Use votes, popularity, name or modified.", true, false),
     InvalidColorMode => ("Unknown color mode", "Use auto, always or never.", true, false),
     InvalidElevator => ("Unknown elevation tool", "Use run0 or sudo.", true, false),
-    InstallationReasonRequired => ("Choose an installation reason", "Add --asdeps or --asexplicit.", true, false),
+    InstallationReasonRequired => ("Missing installation reason", "Add --asdeps or --asexplicit.", true, false),
     UnexpectedTargets => ("This command takes no targets", "", true, false),
-    SearchTermRequired => ("Add a search term", "For example: zap search ripgrep", true, false),
-    PackageNameRequired => ("Missing target", "Run zap help <command> for usage and examples.", true, false),
+    SearchTermRequired => ("Missing search term", "Usage: zap search TERM", true, false),
+    PackageNameRequired => ("Missing target", "Run zap help COMMAND for usage and examples.", true, false),
     InvalidPackageName => ("Not a valid package name", "Names use letters, digits and @ . _ + - and cannot start with a hyphen or dot.", true, false),
-    DuplicateTarget => ("Target given more than once", "", true, false),
+    DuplicateTarget => ("Target given more than once", "Remove the repeated name.", true, false),
     InvalidSelection => ("Not a valid selection", "Choose numbers from the results, for example: 1 3-5", false, false),
-    ConflictingSelection => ("Selected the same package from a repository and the AUR", "Choose one source for each package name.", false, false),
 
     // Environment.
     BuildsMustNotRunAsRoot => ("Run zap as your regular user", "Only the internal transaction worker runs as root, started through run0 or sudo after you approve a change.", false, false),
-    InteractiveTerminalRequired => ("An interactive terminal is required", "Every system change is confirmed at a prompt. Run zap from a terminal, or pass --noconfirm to install or upgrade unattended.", false, false),
-    ConfirmationRequired => ("Input ended before the question was answered", "Nothing was approved. Run zap from an interactive terminal.", false, false),
+    InteractiveTerminalRequired => ("zap needs an interactive terminal to confirm changes", "Every system change is confirmed at a prompt. Run zap from a terminal; install, upgrade, install-local and install-files also take --noconfirm to run unattended.", false, false),
+    SelectNeedsTerminal => ("zap select needs an interactive terminal to choose packages", "Run zap search to list matches, then zap install NAME.", false, false),
+    ConfirmationRequired => ("Input ended before the question was answered", "Nothing was approved. Answer at the prompt, or pass --noconfirm to install or upgrade unattended.", false, false),
     InputTooLong => ("The reply was too long", "", false, false),
     HomeNotSet => ("HOME is not set", "zap keeps its build cache under $XDG_CACHE_HOME or $HOME/.cache.", false, false),
     InvalidCacheDirectory => ("XDG_CACHE_HOME must be an absolute path", "", false, false),
@@ -69,10 +73,13 @@ kinds! {
     InvalidWorkerArguments => ("The transaction worker was started incorrectly", "", false, false),
 
     // Lookups.
-    PackageNotFound => ("No such package in the repositories or the AUR", "Run zap search <term> to look for similar names.", false, false),
-    RepositoryPackageNotFound => ("No such package in the configured repositories", "Run zap search <term>, or drop --repo to include the AUR.", false, false),
-    AurPackageNotFound => ("No such package in the AUR", "Run zap search <term> --aur to look for similar names.", false, false),
-    PackageNotInstalled => ("Package is not installed", "Run zap list to see installed packages.", false, false),
+    PackageNotFound => ("No such package in the repositories or the AUR", "Run zap search {name} to look for similar names.", false, false),
+    UnknownRepository => ("No such repository", "Prefix a name with a configured repository, aur/ or local/, as search results show it.", true, false),
+    NotInRepository => ("No such package in that repository", "", false, false),
+    ShadowedRepository => ("An earlier repository carries this package", "", false, false),
+    RepositoryPackageNotFound => ("No such package in the configured repositories", "Run zap search {name} --aur to look in the AUR.", false, false),
+    AurPackageNotFound => ("No such package in the AUR", "Run zap search {name} --aur to look for similar names.", false, false),
+    PackageNotInstalled => ("Package is not installed", "Run zap search {name} to find it.", false, false),
     FileNotOwned => ("No installed package owns a requested file", "", false, true),
     MissingInstalledFiles => ("Installed files are missing", "", false, true),
     FileInspectionFailed => ("Could not inspect an installed file", "", false, false),
@@ -82,6 +89,8 @@ kinds! {
     RequestFailed => ("Network request failed", "Check your connection and try again.", false, false),
     RateLimited => ("The server is rate limiting requests", "Wait a while before trying again.", false, false),
     AurApiError => ("The AUR rejected the request", "", false, false),
+    TooManyAurResults => ("Too many AUR packages match", "Use a longer or more specific term.", false, false),
+    AurTermTooShort => ("Search term too short for the AUR", "Use at least 2 characters.", true, false),
     InvalidAurResponse => ("The AUR returned a response zap does not accept", "", false, false),
     InvalidNewsFeed => ("The Arch news feed was not in the expected format", "Read https://archlinux.org/news/ directly.", false, false),
 
@@ -97,7 +106,7 @@ kinds! {
     RepositoryRegistrationFailed => ("libalpm could not register a repository", "", false, false),
     AlpmInitializationFailed => ("libalpm could not open the package database", "", false, false),
     AlpmOperationFailed => ("libalpm could not complete the operation", "See the diagnostic above. Never remove an active database lock.", false, false),
-    RequiredByOthers => ("Other installed packages still need this, directly or through what it provides", "Remove the packages that need it in the same command, or keep it.", false, false),
+    RequiredByOthers => ("Cannot remove a package others need", "Keep it, or remove what needs it in the same command.", false, false),
     ProtectedPackage => ("Refusing to remove a package protected by HoldPkg", "Edit HoldPkg in /etc/pacman.conf if this removal is intended.", false, false),
 
     // Dependency planning.
@@ -105,16 +114,18 @@ kinds! {
     DependencyCycle => ("Build dependencies form a cycle", "zap does not bootstrap cycles; build one of the packages by hand first.", false, false),
     DependencyGraphTooLarge => ("The dependency graph is too large to plan", "", false, false),
     UnsatisfiedDependency => ("Nothing provides a dependency", "It is in neither the configured repositories nor the AUR.", false, false),
-    InvalidProvider => ("Not one of the listed providers", "", false, false),
     AurMetadataMismatch => ("AUR sources do not match the AUR's own metadata", "The .SRCINFO may be stale; report it on the package's AUR page.", false, false),
     InvalidSrcInfo => ("The .SRCINFO is malformed", "", false, false),
     StaleSrcInfo => ("The PKGBUILD and .SRCINFO disagree", "zap plans from .SRCINFO, so it must describe the PKGBUILD. Regenerate it with makepkg --printsrcinfo.", false, false),
-    BuildRequiresAurPackage => ("Nothing to build", "build only builds AUR packages; use zap install for repository packages.", false, false),
-    MissingBuildDependencies => ("A build dependency is not installed", "build never installs anything; use zap install to resolve dependencies.", false, false),
+    BuildRequiresAurPackage => ("Nothing to build", "Only AUR packages are built. Run zap install for repository packages.", false, false),
+    MissingBuildDependencies => ("A build dependency is not installed", "zap build never installs anything. Install it first, or run zap install to build and install together.", false, false),
 
     // Sources and builds.
-    ModifiedBuildFiles => ("Cached build files have local edits", "Commit or discard the edits, or run zap clean <base> to fetch a fresh copy.", false, false),
+    UnattendedConflict => ("Cannot replace an installed package unattended", "Remove the installed package first, or run without --noconfirm.", false, false),
+    NotInBuildCache => ("Not in the build cache", "Run zap clean --dry-run to list what is cached.", false, false),
+    ModifiedBuildFiles => ("Cached build files have local edits", "Commit or discard the edits, or run zap clean BASE to fetch a fresh copy.", false, false),
     UnsafeBuildFile => ("Build sources contain an unsafe file", "Tracked sources must be regular files you own: no links, devices or paths that leave the directory.", false, false),
+    LocalBuildFileMissing => ("Missing build file", "", false, false),
     LocalSourceTooLarge => ("The local source directory is too large to snapshot", "Limits: 1024 files, 64 MiB in total, 16 MiB per file, 32 levels deep.", false, false),
     SourceNotReviewed => ("Sources were not reviewed", "", false, false),
     BuildSourceChanged => ("Build files changed after you reviewed them", "Nothing further was built or installed. Review the package again.", false, false),
@@ -144,6 +155,10 @@ kinds! {
     // Control flow.
     Cancelled => ("Cancelled", "", false, false),
     WorkerCancelled => ("Cancelled", "", false, true),
+    Declined => ("Cancelled", "", false, false),
+    WorkerDeclined => ("Cancelled", "", false, true),
+    // updates, orphans or foreign found nothing: exit 1, as pacman does.
+    NothingFound => ("Nothing found", "", false, true),
 
     // Operating system.
     FileNotFound => ("No such file or directory", "", false, false),
@@ -247,6 +262,13 @@ pub fn with_hint(kind: impl Into<Error>, hint: impl Into<String>, subject: impl 
     e
 }
 
+/// A failure with no subject and a specific hint.
+pub fn hinted(kind: Kind, hint: impl Into<String>) -> Error {
+    let mut e = Error::from(kind);
+    e.hint = Some(hint.into());
+    e
+}
+
 /// `Err(kind)` shorthand.
 pub fn fail<T>(kind: Kind) -> Result<T> {
     Err(kind.into())
@@ -254,9 +276,14 @@ pub fn fail<T>(kind: Kind) -> Result<T> {
 
 /// Print the failure and return the process exit status.
 pub fn report(err: &Error) -> u8 {
-    if err.kind == Kind::Cancelled {
-        ui::note(ui::NoteKind::Info, "Cancelled.");
-        return EXIT_CANCELLED;
+    // An interrupt exits 130 as a shell would; answering no is a plain failure, as in pacman.
+    if err.kind == Kind::Cancelled || err.kind == Kind::Declined {
+        let hint = err.hint.as_deref().map(|h| format!(" {h}")).unwrap_or_default();
+        ui::note(ui::NoteKind::Info, &format!("Cancelled.{hint}"));
+        return if err.kind == Kind::Declined { EXIT_FAILURE } else { EXIT_CANCELLED };
+    }
+    if err.kind == Kind::WorkerDeclined {
+        return EXIT_FAILURE;
     }
     // The root worker already said so.
     if err.kind == Kind::WorkerCancelled {
@@ -265,7 +292,10 @@ pub fn report(err: &Error) -> u8 {
     let entry = err.kind.describe();
     if !entry.silent {
         let hint = err.hint.as_deref().unwrap_or(entry.hint);
-        ui::problem(ui::NoteKind::Failure, &err.message(), hint);
+        // Catalog hints name the subject as {name}: the package itself when
+        // there is exactly one, a placeholder otherwise.
+        let name = err.subject.as_deref().filter(|s| !s.is_empty() && !s.contains(char::is_whitespace)).unwrap_or("NAME");
+        ui::problem(ui::NoteKind::Failure, &err.message(), &hint.replace("{name}", name));
     }
     if entry.usage {
         EXIT_USAGE
@@ -298,12 +328,13 @@ mod tests {
         assert_eq!(EXIT_USAGE, report(&with_hint(Kind::UnknownCommand, "Did you mean install?", "instal")));
         assert_eq!(EXIT_CANCELLED, report(&Kind::Cancelled.into()));
         assert_eq!(EXIT_CANCELLED, report(&Kind::WorkerCancelled.into()));
+        assert_eq!(EXIT_FAILURE, report(&Kind::Declined.into()));
         assert_eq!(EXIT_FAILURE, report(&Kind::WorkerFailed.into()));
         assert_eq!(EXIT_FAILURE, report(&Kind::FileNotOwned.into()));
         let out = ui::end_capture();
         ui::set_caps(None);
         assert_eq!(
-            "  × Package is not installed: ghost [2J\n    Run zap list to see installed packages.\n  × Unknown command\n    Run zap help to list every command.\n  × Unknown command: instal\n    Did you mean install?\n  · Cancelled.\n",
+            "  × Package is not installed: ghost [2J\n    Run zap search ghost [2J to find it.\n  × Unknown command\n    Run zap help to list every command.\n  × Unknown command: instal\n    Did you mean install?\n  · Cancelled.\n  · Cancelled.\n",
             out
         );
     }

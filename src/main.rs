@@ -50,6 +50,10 @@ fn run() -> u8 {
         }
         return match commands::worker(&args[1]) {
             Ok(()) => 0,
+            Err(e) if e.kind == errors::Kind::Declined => {
+                errors::report(&e);
+                errors::EXIT_WORKER_DECLINED
+            }
             Err(e) => errors::report(&e),
         };
     }

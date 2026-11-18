@@ -112,7 +112,7 @@ unrelated `zap-git` and `zap-bin` packages, which also install `/usr/bin/zap`.
 | `remove PACKAGES` | `-R` | Remove packages with ALPM dependency checks |
 | `orphans` | `-Qdt` | List dependencies with no required or optional users |
 | `autoremove` | | Review and remove orphan dependencies |
-| `clean [BASES]` | `-Sc` | Clear all or selected cached package-base directories |
+| `clean [BASES]` | | Clear all or selected cached package-base directories |
 | `help [COMMAND]` | `-h` | The overview, or one command's usage, options and examples |
 | `version` | `--version` | Show the zap, libalpm (as ported) and Rust versions |
 
@@ -211,17 +211,17 @@ Failures are reported on standard error as one line saying what failed and for w
 
 ```text
   × Package is not installed: ripgrap
-    Run zap list to see installed packages.
+    Run zap search ripgrap to find it, or zap list to see what is installed.
 ```
 
 | Exit status | Meaning |
 | --- | --- |
 | 0 | Success |
-| 1 | The operation failed, or `owns` / `check` found an unowned or missing file |
+| 1 | The operation failed, a prompt was answered no, `owns` / `check` found an unowned or missing file, or `search`, `local-search`, `updates`, `orphans` or `foreign` found nothing |
 | 2 | The command line was wrong |
-| 130 | Cancelled at a prompt or by a signal |
+| 130 | Interrupted, for example with Ctrl-C |
 
-Color follows the terminal palette: cyan for repositories and headings, magenta for the AUR, green for versions and success, yellow for notices, red for removals and errors. `--color=auto|always|never` selects styling; in `auto`, a non-empty `NO_COLOR`, `TERM=dumb` and redirected output disable it, and under run0 disabled styling also applies to the root worker. In a locale without UTF-8, and on the Linux console, glyphs fall back to ASCII. Styled output links package names in search results and details to their AUR or archlinux.org page, and package details mark installed optional dependencies. Output to a pipe contains no styling or cursor control, and bulk listings are written in batches. `--quiet` prints bare names or file paths with no headings or summaries, for scripts. Remote and package-supplied text is filtered before display: control characters, including 8-bit C1 controls, are blanked, and bidirectional overrides are shown as a replacement character so reviewed sources cannot display misleadingly. Confirmations default to **No** and require an explicit `y` or `yes`, except under `--noconfirm`, which prints each question with the answer it gave.
+Color follows the terminal palette: cyan for repositories and headings, magenta for the AUR, green for versions and success, yellow for notices, red for removals and errors. `--color=auto|always|never` selects styling; in `auto`, a non-empty `NO_COLOR`, `TERM=dumb` and redirected output disable it, and under run0 disabled styling also applies to the root worker. In a locale without UTF-8, and on the Linux console, glyphs fall back to ASCII. Styled output links package names in search results and details to their AUR or archlinux.org page, and package details mark installed optional dependencies. Output to a pipe contains no styling or cursor control, and bulk listings are written in batches. `--quiet` prints bare names or file paths with no headings or summaries, for scripts. Remote and package-supplied text is filtered before display: control characters, including 8-bit C1 controls, are blanked, and bidirectional overrides are shown as a replacement character so reviewed sources cannot display misleadingly. Each prompt shows its default in capitals and takes it on Enter: `[Y/n]` where `--noconfirm` would answer yes (the final transaction, approving unchanged build files again, IgnorePkg, replacements and key imports), `[y/N]` for removing a conflicting package, approving new or changed build code and clearing the build cache. Under `--noconfirm`, zap prints each question with the answer it gave.
 
 Dates are UTC calendar dates, with an approximate age where it helps (`2026-07-16 · 4 months ago`); a missing timestamp shows `unknown`. AUR dates are the RPC `LastModified`; repository dates are build dates; local listings show installation dates.
 

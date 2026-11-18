@@ -5,6 +5,8 @@ use crate::net;
 
 const FEED: &str = "https://archlinux.org/feeds/news/";
 const SHOWN: usize = 10;
+/// Only items this recent count towards the warnings above the list.
+const RECENT_DAYS: i64 = 30;
 
 #[derive(Debug)]
 pub struct Item {
@@ -146,22 +148,26 @@ fn urgency(title: &str) -> Urgency {
 }
 
 pub fn show() -> Result<()> {
-    let items = decode(&net::get(FEED)?)?;
+    // Offline, the page itself is still the place to read it later.
+    let feed = net::get(FEED).map_err(|e| if e.kind == Kind::RequestFailed { errors::with_hint(Kind::RequestFailed, "Check your connection, or read https://archlinux.org/news/ directly.", e.subject.clone().unwrap_or_default()) } else { e })?;
+    let items = decode(&feed)?;
     let latest = &items[..items.len().min(SHOWN)];
-    let count = |u| latest.iter().filter(|item| urgency(&item.title) == u).count();
+    let since = ui::now() - RECENT_DAYS * 86400;
+    let recent = |item: &&Item| published(&item.date).is_some_and(|at| at >= since);
+    let count = |u| latest.iter().filter(recent).filter(|item| urgency(&item.title) == u).count();
     let (intervention, security) = (count(Urgency::Intervention), count(Urgency::Security));
-    ui::heading("Arch Linux news", "latest first");
+    ui::heading("Arch Linux news", "latest first · ! manual intervention · ◆ security");
     // The warnings come first: they are what must not be scrolled past.
     if intervention > 0 {
         let items = ui::count(intervention, "item", "items");
-        ui::note(NoteKind::Warning, &format!("{items} marked ! need manual intervention. Read them before running zap upgrade."));
+        ui::note(NoteKind::Warning, &format!("{items} from the last {RECENT_DAYS} days mention manual intervention. Read them before running zap upgrade."));
     }
     if security > 0 {
         let items = ui::count(security, "item", "items");
-        ui::marked("◆", Tone::Danger, &format!("{items} marked ◆ concern security. Check whether they affect you."), Tone::Plain);
+        ui::marked("◆", Tone::Danger, &format!("{items} from the last {RECENT_DAYS} days concern security. Check whether they affect you."), Tone::Plain);
     }
     if intervention == 0 && security == 0 {
-        ui::note(NoteKind::Info, "Nothing here asks for manual intervention.");
+        ui::note(NoteKind::Info, &format!("Nothing from the last {RECENT_DAYS} days mentions manual intervention or security."));
     }
     for item in latest {
         ui::blank();
@@ -171,10 +177,14 @@ pub fn show() -> Result<()> {
             Urgency::Security => ("◆", Tone::Danger),
             Urgency::None => ("·", Tone::Muted),
         };
-        ui::marked(mark, tone, &item.title, Tone::Bold);
+        // A colour terminal links the title; elsewhere the URL gets a line.
+        let linked = ui::marked_link(mark, tone, &item.title, Tone::Bold, &item.link);
         let date = published(&item.date).map(ui::dated).unwrap_or_else(|| item.date.clone());
         ui::text(&date, 4, Tone::Muted);
-        ui::line(&item.link, 4, Tone::Accent);
+        // Items that need action keep a visible URL for terminals without links.
+        if !linked || tone != Tone::Muted {
+            ui::line(&item.link, 4, Tone::Accent);
+        }
     }
     ui::blank();
     Ok(())

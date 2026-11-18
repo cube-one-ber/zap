@@ -3,7 +3,7 @@
 //! write to its temporary download directory (Landlock), and is denied a
 //! list of dangerous system calls (seccomp). It reports its log messages to
 //! the parent over a pipe.
-use super::log::{self, Frontend, Level};
+use super::log::{self, Frontend, Level, Progress};
 use super::Handle;
 use std::ffi::CString;
 use std::io::{Read, Write};
@@ -295,9 +295,10 @@ fn filter_syscalls() -> bool {
 /// Frames on the pipe from the child: a tag byte, then the payload.
 const FRAME_LOG: u8 = 0;
 const FRAME_RESULT: u8 = 1;
+const FRAME_PROGRESS: u8 = 2;
 
-/// The child's front end: log messages go to the parent. The child raises
-/// no events or questions while downloading.
+/// The child's front end: log messages and download progress go to the
+/// parent. The child raises no events or questions while downloading.
 pub(crate) struct PipeFrontend(pub std::sync::Mutex<std::fs::File>);
 
 impl Frontend for PipeFrontend {
@@ -310,6 +311,19 @@ impl Frontend for PipeFrontend {
         let mut frame = vec![FRAME_LOG, level];
         frame.extend_from_slice(&(message.len() as u32).to_ne_bytes());
         frame.extend_from_slice(message.as_bytes());
+        let _ = self.0.lock().unwrap_or_else(|e| e.into_inner()).write_all(&frame);
+    }
+
+    fn progress(&self, kind: Progress, name: &str, percent: i32, total: usize, current: usize) {
+        if kind != Progress::Download {
+            return;
+        }
+        let mut frame = vec![FRAME_PROGRESS, 0];
+        frame.extend_from_slice(&(12 + name.len() as u32).to_ne_bytes());
+        frame.extend_from_slice(&percent.to_ne_bytes());
+        frame.extend_from_slice(&(total as u32).to_ne_bytes());
+        frame.extend_from_slice(&(current as u32).to_ne_bytes());
+        frame.extend_from_slice(name.as_bytes());
         let _ = self.0.lock().unwrap_or_else(|e| e.into_inner()).write_all(&frame);
     }
 }
@@ -333,7 +347,7 @@ pub(crate) fn relay(mut pipe: std::fs::File) -> (Option<Vec<u8>>, bool) {
             return Ok(None);
         }
         let mut level = [0u8; 1];
-        if tag[0] == FRAME_LOG {
+        if tag[0] == FRAME_LOG || tag[0] == FRAME_PROGRESS {
             pipe.read_exact(&mut level)?;
         } else if tag[0] != FRAME_RESULT {
             return Err(std::io::ErrorKind::InvalidData.into());
@@ -359,6 +373,13 @@ pub(crate) fn relay(mut pipe: std::fs::File) -> (Option<Vec<u8>>, bool) {
                     _ => log::debug(&message),
                 }
             }
+            Ok(Some((FRAME_PROGRESS, _, body))) if body.len() >= 12 => {
+                let word = |at: usize| [body[at], body[at + 1], body[at + 2], body[at + 3]];
+                let (total, current) = (u32::from_ne_bytes(word(4)) as usize, u32::from_ne_bytes(word(8)) as usize);
+                let name = String::from_utf8_lossy(&body[12..]);
+                log::progress(Progress::Download, &name, i32::from_ne_bytes(word(0)), total, current);
+            }
+            Ok(Some((FRAME_PROGRESS, _, _))) => return (result, false),
             Ok(Some((_, _, body))) => result = Some(body),
             Err(_) => return (result, false),
         }

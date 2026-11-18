@@ -65,6 +65,12 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Package>> {
     let response: Response = serde_json::from_slice(bytes).map_err(|_| Kind::InvalidAurResponse)?;
     if response.version != 5 || response.r#type == "error" {
         let message = response.error.as_deref().unwrap_or("unsupported API response");
+        if message == "Too many package results." {
+            return errors::fail(Kind::TooManyAurResults);
+        }
+        if message == "Query arg too small." {
+            return errors::fail(Kind::AurTermTooShort);
+        }
         return Err(errors::with(Kind::AurApiError, message));
     }
     if response.results.len() != response.resultcount {

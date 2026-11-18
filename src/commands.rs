@@ -1,7 +1,9 @@
 //! Command dispatch. Each command is a short flow over the modules that do
 //! the work.
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::alpm::{self, Alpm, PkgRef};
-use crate::builder::Builder;
+use crate::builder::{self, Builder};
 use crate::cli::{Command, Options, Reason, Scope, ELEVATING};
 use crate::errors::{self, Kind, Result};
 use crate::libalpm::{self, archive, vercmp, LIBALPM_VERSION};
@@ -15,9 +17,6 @@ pub fn run(o: Options) -> Result<()> {
     if o.command == Command::Help {
         help::show(o.topic);
         return Ok(());
-    }
-    if o.dry {
-        ui::note(NoteKind::Warning, "Dry run: nothing will be built, elevated or changed.");
     }
     if o.command == Command::Version {
         let rust = env!("ZAP_RUSTC_VERSION");
@@ -35,16 +34,24 @@ pub fn run(o: Options) -> Result<()> {
             tx::chosen_elevator()?;
         } else {
             tx::trusted_elevator()?;
+            // Fail before planning, not after a plan nobody can confirm.
+            // select says so itself, with its own hint. --needed may find
+            // nothing to do, which a script must be able to run.
+            if !o.noconfirm && !o.needed && o.command != Command::Select && unsafe { libc::isatty(0) } == 0 {
+                return errors::fail(Kind::InteractiveTerminalRequired);
+            }
         }
     }
     if o.command == Command::News {
         return news::show();
     }
+    let mut db = Alpm::init()?;
+    let o = strip_sources(&db, o)?;
     check_names(&o)?;
 
-    let mut db = Alpm::init()?;
     let result = match o.command {
-        Command::Search => query::search(&db, &o).map(drop),
+        // As pacman -Ss, finding nothing exits 1.
+        Command::Search => query::search(&db, &o).and_then(|m| if m.is_empty() { errors::fail(Kind::NothingFound) } else { Ok(()) }),
         Command::Select => select(&mut db, &o),
         Command::Info | Command::Localinfo => query::info(&db, &o),
         Command::List | Command::Foreign => query::list(&db, &o),
@@ -53,7 +60,8 @@ pub fn run(o: Options) -> Result<()> {
         Command::Owns => query::owners(&db, &o.names, o.quiet),
         Command::Check => query::check(&db, &o.names),
         Command::Stats => query::stats(&db),
-        Command::Updates => updates(&db, &o).map(drop),
+        // As with pacman -Qu, a script can test for updates by the exit status.
+        Command::Updates => updates(&db, &o).and_then(|t| if t.is_empty() { errors::fail(Kind::NothingFound) } else { Ok(()) }),
         Command::Upgrade => upgrade(&mut db, &o),
         Command::Install | Command::Build => install(&mut db, &o),
         Command::Get | Command::Pkgbuild => fetch(&mut db, &o),
@@ -67,7 +75,99 @@ pub fn run(o: Options) -> Result<()> {
     };
     // The process exits next; freeing every cached package first only costs time.
     std::mem::forget(db);
+    // Said last, under the plan; a failure already says what went wrong.
+    // Nothing to do needs no reminder that nothing was done.
+    if o.dry && result.is_ok() && !NOTHING_TO_DO.load(Ordering::Relaxed) {
+        let fetched = builder::sources_fetched();
+        let undone = match o.command {
+            Command::Clean => "nothing was deleted",
+            Command::Reason => "no installation reasons were changed",
+            // Fetching did write to the cache, so "nothing changed" would not hold.
+            _ if fetched => "nothing was built or installed",
+            _ => "nothing changed",
+        };
+        let cache = if fetched { "; AUR build files were fetched to the build cache" } else { "" };
+        ui::separate();
+        ui::note(NoteKind::Info, &format!("Dry run: {undone}{cache}."));
+        ui::blank();
+    }
     result
+}
+
+/// Set when a command found nothing to do, so a dry run has nothing to disclaim.
+static NOTHING_TO_DO: AtomicBool = AtomicBool::new(false);
+
+pub fn nothing_to_do() {
+    NOTHING_TO_DO.store(true, Ordering::Relaxed);
+}
+
+/// Names as search results show them, such as extra/ripgrep, aur/yay-bin
+/// or local/zap. The prefix must name a configured repository, aur or
+/// local. Installing and info take an aur/ target from the AUR and a
+/// repository target from that repository; search limits itself to the
+/// kind of source named; commands on installed packages just drop it.
+fn strip_sources(db: &Alpm, mut o: Options) -> Result<Options> {
+    use Command::*;
+    let sourced = matches!(o.command, Install | Build | Get | Pkgbuild | Info);
+    let searching = matches!(o.command, Search | Select);
+    let local = matches!(o.command, Localinfo | Files | Remove | List | Check | Reason);
+    if !(sourced || searching || local) {
+        return Ok(o);
+    }
+    let repositories: Vec<&str> = db.h.syncdbs.iter().map(|d| d.name.as_str()).collect();
+    for name in &mut o.names {
+        // A path or an archive, typed as pacman -U or paru would take it.
+        if matches!(o.command, Install | Build) && (name.starts_with(['.', '/']) || name.contains(".pkg.tar")) {
+            let hint = if name.contains(".pkg.tar") { format!("Use zap install-files {name} for a package archive.") } else { format!("Use zap install-local {name} for a directory with a PKGBUILD.") };
+            return Err(errors::with_hint(Kind::InvalidPackageName, hint, name.as_str()));
+        }
+        let Some((prefix, rest)) = name.split_once('/') else { continue };
+        let rest = rest.to_string();
+        if !util::valid_name(prefix) || rest.is_empty() {
+            return Err(errors::with(Kind::InvalidPackageName, name.as_str()));
+        }
+        let known = prefix == "aur" || prefix == "local" || repositories.contains(&prefix);
+        if prefix == "local" && !local {
+            return Err(errors::with_hint(Kind::UnknownRepository, "local/ names an installed package. Use a repository or aur/ prefix here.", prefix));
+        }
+        if !known {
+            // repo/ is a natural guess after reading about --repo.
+            let flag = if prefix == "repo" { "repo/ is not a prefix; pass --repo to use any repository. " } else { "" };
+            let hint = format!("{flag}Configured repositories: {}. Use aur/ for the AUR.", repositories.join(", "));
+            return Err(errors::with_hint(Kind::UnknownRepository, hint, prefix));
+        }
+        if searching {
+            o.scope = if prefix == "aur" { Scope::Aur } else { Scope::Repo };
+        } else if sourced && prefix == "aur" {
+            o.aur_names.push(rest.clone());
+        } else if sourced {
+            check_repository(db, o.command, prefix, &rest)?;
+        }
+        *name = rest;
+    }
+    Ok(o)
+}
+
+/// A repository/name target: zap takes a package from the first repository
+/// that carries it, so that must be the one named.
+fn check_repository(db: &Alpm, command: Command, repository: &str, name: &str) -> Result<()> {
+    let command = command.tag().replace('_', "-");
+    let named = db.h.syncdbs.iter().find(|d| d.name == repository).and_then(|d| d.get(name));
+    if named.is_none() {
+        let hint = match db.repo(name).filter(|p| p.name == name) {
+            Some(p) => format!("{name} is in {0}: zap {command} {0}/{name}.", alpm::repository(&p)),
+            None if aur::find(name).ok().flatten().is_some() => format!("{name} is in the AUR: zap {command} aur/{name}."),
+            None => format!("Run zap search {name} to see where it is available."),
+        };
+        return Err(errors::with_hint(Kind::NotInRepository, hint, format!("{repository}/{name}")));
+    }
+    match db.repo(name) {
+        Some(first) if alpm::repository(&first) != repository => {
+            let hint = format!("zap installs {name} from {}, the first repository in pacman.conf that has it. Drop the prefix to use that one.", alpm::repository(&first));
+            Err(errors::with_hint(Kind::ShadowedRepository, hint, format!("{repository}/{name}")))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Commands whose targets are package names accept only valid, distinct ones.
@@ -97,11 +197,13 @@ pub fn worker(request: &str) -> Result<()> {
 
 fn configure(builds: &mut Builder, o: &Options) {
     builds.scope = o.scope;
+    builds.aur_targets = o.aur_names.clone();
     builds.needed = o.needed;
     builds.reason = o.reason;
     builds.sandbox = o.sandbox.unwrap_or(true);
     builds.clean_after = o.clean_after;
     builds.rebuild_tree = o.rebuild_tree;
+    builds.build_only = matches!(o.command, Command::Build | Command::BuildLocal);
 }
 
 // ── Install and build ───────────────────────────────────────────────────────
@@ -110,10 +212,6 @@ fn install(db: &mut Alpm, o: &Options) -> Result<()> {
     let mut builds = Builder::new(db, &o.names)?;
     configure(&mut builds, o);
     builds.plan()?;
-    // A dry run must refuse what the real build would refuse.
-    if o.command == Command::Build {
-        builds.require_installed_dependencies()?;
-    }
     if !o.dry {
         builds.execute(o.command == Command::Install)?;
     }
@@ -125,9 +223,6 @@ fn install_local(db: &mut Alpm, o: &Options) -> Result<()> {
     configure(&mut builds, o);
     builds.load_local(&o.names)?;
     builds.plan()?;
-    if o.command == Command::BuildLocal {
-        builds.require_installed_dependencies()?;
-    }
     if !o.dry {
         builds.execute(o.command == Command::InstallLocal)?;
     }
@@ -144,16 +239,30 @@ fn fetch(db: &mut Alpm, o: &Options) -> Result<()> {
 }
 
 fn select(db: &mut Alpm, o: &Options) -> Result<()> {
+    // Check before searching, so a script does not wait on the AUR for nothing.
+    if unsafe { libc::isatty(0) } == 0 {
+        return errors::fail(Kind::SelectNeedsTerminal);
+    }
+    // The search already said that nothing matches and what to try.
     let matches = query::search(db, o)?;
     if matches.is_empty() {
-        return Err(errors::with(Kind::PackageNotFound, o.names.join(" ")));
+        return errors::fail(Kind::NothingFound);
     }
+    // A selection that cannot be installed is asked again, not fatal.
     let selected = loop {
-        let reply = ui::answer("Install which? Numbers or ranges such as 1 3-5; empty cancels:")?;
+        let example = if matches.len() > 1 { format!("1-{}", matches.len().min(3)) } else { "1".into() };
+        let reply = ui::answer(&format!("Install which? Numbers or ranges such as {example}; empty cancels:"))?;
         match query::selection(&reply, matches.len()) {
-            Ok(selected) => break selected,
+            Ok(selected) => {
+                // One name cannot be installed from both a repository and the AUR.
+                let twice = selected.iter().find(|&&i| selected.iter().any(|&j| j != i && matches[j].name == matches[i].name));
+                match twice {
+                    Some(&i) => ui::note(NoteKind::Warning, &format!("{} was chosen from both a repository and the AUR. Choose one.", matches[i].name)),
+                    None => break selected,
+                }
+            }
             Err(e) if e.kind == Kind::InvalidSelection => {
-                ui::note(NoteKind::Warning, &format!("Use numbers from 1 to {}, or ranges such as 1-3.", matches.len()));
+                ui::note(NoteKind::Warning, &format!("Use numbers from 1 to {}, or a range such as {example}.", matches.len()));
             }
             Err(e) => return Err(e),
         }
@@ -162,10 +271,6 @@ fn select(db: &mut Alpm, o: &Options) -> Result<()> {
     let mut aur_names = Vec::new();
     for &index in &selected {
         let chosen = &matches[index];
-        // One name cannot be installed from both a repository and the AUR.
-        if selected.iter().any(|&other| other != index && matches[other].name == chosen.name) {
-            return Err(errors::with(Kind::ConflictingSelection, &chosen.name));
-        }
         names.push(chosen.name.clone());
         // Keep the chosen source when a repository and the AUR share a name.
         if chosen.source == Scope::Aur {
@@ -263,6 +368,7 @@ fn updates(db: &Alpm, o: &Options) -> Result<Vec<String>> {
 
     let mut targets = Vec::new();
     let mut absent = Vec::new();
+    let mut vcs = 0;
     let remote = aur::info(&foreign)?;
     for name in foreign {
         let Some(p) = remote.iter().find(|candidate| candidate.Name == name) else {
@@ -270,6 +376,7 @@ fn updates(db: &Alpm, o: &Options) -> Result<Vec<String>> {
             continue;
         };
         let Some(old) = db.installed_pkg(name) else { continue };
+        vcs += usize::from(is_vcs(name));
         let rebuild = o.devel && is_vcs(name);
         let newer = vercmp(&p.Version, &old.version) > 0;
         if !newer && !rebuild {
@@ -294,46 +401,79 @@ fn updates(db: &Alpm, o: &Options) -> Result<Vec<String>> {
         ui::release();
         return Ok(targets);
     }
-    ui::heading("Updates", &ui::count(names.len(), "package", "packages"));
-    table.render();
-    if names.is_empty() {
-        ui::note(NoteKind::Success, if o.scope == Scope::Aur { "AUR packages are up to date." } else { "Everything is up to date." });
-    } else if o.command == Command::Updates {
+    // A dry upgrade compares against the same cached databases, so both say how old they are.
+    let compared = (o.command == Command::Updates || o.dry) && o.scope != Scope::Aur;
+    let synced = if compared { db.synced_at() } else { 0 };
+    let stale = synced != 0 && ui::now() - synced > 24 * 3600;
+    let refresh = if o.command == Command::Upgrade { "a real run" } else { "zap upgrade" };
+    let age = ui::age(synced, ui::now());
+    // How fresh the list is qualifies it, so it comes first, as under
+    // upgrade, where the plan that follows is the list. A heading brings
+    // its own blank line.
+    if names.is_empty() || compared {
+        ui::blank();
+    }
+    let freshness = format!("Repository databases were last refreshed {age}; {refresh} refreshes them first");
+    let no_repo_updates = o.command == Command::Upgrade && o.dry && compared && !names.is_empty() && names.len() == targets.len();
+    if names.is_empty() && stale {
+        ui::note(NoteKind::Warning, &format!("No updates found. {freshness}."));
+    } else if compared && synced == 0 {
+        ui::note(NoteKind::Info, "Repository databases are as fresh as the last zap upgrade.");
+    } else if stale && no_repo_updates {
+        ui::note(NoteKind::Warning, &format!("No repository updates found. {freshness}."));
+    } else if compared && stale {
+        ui::note(NoteKind::Warning, &format!("{freshness}, so more updates may appear."));
+    } else if compared {
+        ui::note(NoteKind::Info, &format!("{freshness}."));
+    }
+    if o.devel && vcs == 0 && o.scope != Scope::Repo {
+        ui::separate();
+        ui::note(NoteKind::Info, "--devel found no installed VCS packages from the AUR to check.");
+    }
+    // The plan below holds AUR builds only, so say what the repositories add.
+    let repo_updates = names.len() - targets.len();
+    if o.command == Command::Upgrade && o.dry && repo_updates > 0 {
+        let count = ui::count(repo_updates, "repository update", "repository updates");
+        ui::note(NoteKind::Info, &format!("A real run applies {count} first, before any AUR build; zap updates --repo lists them."));
+    } else if no_repo_updates && !stale {
+        ui::note(NoteKind::Info, "No repository updates found; the plan below has only AUR builds.");
+    }
+    if names.is_empty() && !stale {
+        // updates exits 1 here, as pacman -Qu does, so this is no ✓; upgrade has simply nothing to do.
+        let kind = if o.command == Command::Updates { NoteKind::Info } else { NoteKind::Success };
+        ui::note(kind, if o.scope == Scope::Aur { "AUR packages are up to date." } else { "Everything is up to date." });
+    } else if o.command == Command::Updates && !names.is_empty() {
+        ui::heading("Updates", &ui::count(names.len(), "package", "packages"));
+        table.render();
         ui::blank();
         ui::note(NoteKind::Info, "zap upgrade applies these updates.");
     }
-    if o.command == Command::Updates && o.scope != Scope::Aur {
-        let synced = db.synced_at();
-        if synced == 0 {
-            ui::note(NoteKind::Info, "Repository databases are as fresh as the last zap upgrade.");
-        } else {
-            ui::note(NoteKind::Info, &format!("The oldest repository database dates from {}; zap upgrade refreshes them.", ui::age(synced, ui::now())));
-        }
+    // Said by updates only: an upgrade would repeat it every time.
+    if !absent.is_empty() && o.command == Command::Updates {
+        ui::note(NoteKind::Info, &format!("Not available in the AUR, so zap will not rebuild them: {}", absent.join(", ")));
     }
-    if !absent.is_empty() {
-        ui::note(NoteKind::Info, &format!("Not in the AUR, left as they are: {}", absent.join(", ")));
+    if names.is_empty() || o.command == Command::Updates {
+        ui::blank();
     }
-    ui::blank();
     Ok(targets)
 }
 
 fn upgrade(db: &mut Alpm, o: &Options) -> Result<()> {
-    if o.scope != Scope::Aur {
-        if o.dry {
-            ui::note(NoteKind::Info, "A dry run compares against the repository databases as last refreshed.");
-        } else {
-            tx::escalate(&Request::new(Operation::Upgrade))?;
-            db.reload()?;
-        }
+    if o.scope != Scope::Aur && !o.dry {
+        tx::escalate(&Request::new(Operation::Upgrade))?;
+        db.reload()?;
     }
     let targets = updates(db, o)?;
     if targets.is_empty() {
+        nothing_to_do();
         return Ok(());
     }
     let mut builds = Builder::new(db, &targets)?;
     configure(&mut builds, o);
     builds.scope = Scope::Aur;
     builds.preserve_reasons = true;
+    builds.updating = true;
+    builds.repos_upgraded = o.scope != Scope::Aur;
     builds.plan()?;
     if !o.dry {
         builds.execute(true)?;
@@ -386,31 +526,62 @@ fn remove(db: &Alpm, o: &Options) -> Result<()> {
         total += p.info().isize;
         table.add_text(&[p.name.clone(), p.version.clone(), ui::size(p.info().isize), used_by(&others)]);
     }
-    ui::heading(if o.dry { "Would remove" } else { "Remove" }, &ui::count(packages.len(), "package", "packages"));
-    table.render();
-    ui::blank();
     // What would actually break, as libalpm decides it: a dependency that no
-    // remaining installed package satisfies.
+    // remaining installed package satisfies. Refused before the plan is shown.
     let broken = broken_by(db, &packages);
     if !broken.is_empty() {
-        let named = &broken[..broken.len().min(5)];
-        let more = if broken.len() > named.len() { format!("; and {} more", broken.len() - named.len()) } else { String::new() };
-        return Err(errors::with(Kind::RequiredByOthers, format!("{}{more}", named.join("; "))));
+        return Err(required_by_others(&broken, &o.names));
     }
-    ui::note(
-        NoteKind::Info,
-        &format!(
-            "Frees {}{}{}.",
-            ui::size(total),
-            if o.recursive { " plus any dependencies nothing else needs" } else { "" },
-            if o.nosave { "; configuration files are deleted, not kept as .pacsave" } else { "" },
-        ),
-    );
+    // --recursive also removes the dependencies nothing else needs, as
+    // libalpm will select them; list them rather than leave them vague.
+    let mut all = packages.clone();
+    if o.recursive {
+        libalpm::deps::recursedeps(db.installed(), &mut all, false);
+    }
+    for p in &all[packages.len()..] {
+        total += p.info().isize;
+        table.add_text(&[p.name.clone(), p.version.clone(), ui::size(p.info().isize), "only the packages above".into()]);
+    }
+    ui::heading(if o.dry { "Would remove" } else { "Remove" }, &ui::count(all.len(), "package", "packages"));
+    table.render();
+    ui::blank();
+    let nosave = if o.nosave { "; configuration files are deleted, not kept as .pacsave" } else { "" };
+    ui::note(NoteKind::Info, &format!("Frees {}{nosave}.", ui::size(total)));
     if o.dry {
         ui::blank();
         return Ok(());
     }
     tx::escalate(&Request { targets, recursive: o.recursive, nosave: o.nosave, ..Request::new(Operation::Remove) })
+}
+
+/// The refusal for a removal that would break other packages: which targets
+/// are still needed, the first few broken dependencies, and how to proceed.
+fn required_by_others(broken: &[Broken], removing: &[String]) -> errors::Error {
+    let mut blocked: Vec<&str> = Vec::new();
+    let mut dependants: Vec<&str> = Vec::new();
+    for b in broken {
+        if !blocked.contains(&b.target.as_str()) {
+            blocked.push(&b.target);
+        }
+        if !dependants.contains(&b.dependant.as_str()) {
+            dependants.push(&b.dependant);
+        }
+    }
+    let it = if blocked.len() == 1 { "it" } else { "them" };
+    let hint = if dependants.len() <= 5 {
+        let needs = broken.iter().map(|b| format!("{} needs {}", b.dependant, b.depend)).collect::<Vec<_>>().join(", ");
+        format!("{needs}. Keep {it}, or remove them together: zap remove {} {}", removing.join(" "), dependants.join(" "))
+    } else {
+        // With one target there is nothing left to run without it.
+        let drop = if removing.len() > 1 { format!(" Drop {it} from the command;") } else { String::new() };
+        format!(
+            "{} need {it}, such as {}.{drop} zap localinfo {} lists what needs {it}.",
+            ui::count(dependants.len(), "installed package", "installed packages"),
+            dependants[..3].join(", "),
+            blocked.join(" "),
+        )
+    };
+    errors::with_hint(Kind::RequiredByOthers, hint, blocked.join(", "))
 }
 
 /// The "Used by" cell: the first few dependants, then how many more.
@@ -426,11 +597,23 @@ fn used_by(dependants: &[String]) -> String {
 }
 
 /// Installed packages whose dependencies would no longer be satisfied once
-/// `removals` are gone, as `dependant needs dependency`.
-fn broken_by(db: &Alpm, removals: &[PkgRef]) -> Vec<String> {
+/// `removals` are gone, as (dependant, dependency) in dependant order.
+/// An installed package that would lose a dependency: `dependant` needs
+/// `depend`, which only `target`, a package being removed, provides.
+#[derive(Debug, PartialEq)]
+struct Broken {
+    dependant: String,
+    depend: String,
+    target: String,
+}
+
+fn broken_by(db: &Alpm, removals: &[PkgRef]) -> Vec<Broken> {
     libalpm::deps::checkdeps(db.installed(), removals, &[], true)
         .into_iter()
-        .map(|missing| format!("{} needs {}", missing.target, missing.depend))
+        .map(|missing| {
+            let target = missing.causing.unwrap_or_else(|| missing.depend.name.clone());
+            Broken { dependant: missing.target, depend: missing.depend.to_string(), target }
+        })
         .collect()
 }
 
@@ -440,12 +623,28 @@ fn reason(db: &Alpm, o: &Options) -> Result<()> {
         Reason::Explicit => "explicit",
         Reason::Dependency => "dependency",
     };
-    let mut targets = Vec::new();
+    let (mut targets, mut unchanged) = (Vec::new(), Vec::new());
     let mut table = Table::new(&[Column::new("Package").tone(Tone::Bold), Column::new("Current"), Column::new("New").tone(Tone::Accent).joiner(" → ")]);
     for name in &o.names {
         let p = query::installed(db, name)?;
+        if alpm::reason(p) == wanted_name {
+            unchanged.push(name.as_str());
+            continue;
+        }
         targets.push(Target { reason: Some(wanted), ..Target::named(name) });
         table.add_text(&[name.as_str(), alpm::reason(p), wanted_name]);
+    }
+    // Already right needs no change, and so no administrator access.
+    if !unchanged.is_empty() {
+        let installed = if wanted == Reason::Explicit { "explicitly installed" } else { "installed as a dependency" };
+        let (subject, verb) = if unchanged.len() == 1 { (unchanged[0].to_string(), "is") } else { (unchanged.join(", "), "are") };
+        ui::blank();
+        ui::note(if targets.is_empty() { NoteKind::Success } else { NoteKind::Info }, &format!("{subject} {verb} already {installed}."));
+        if targets.is_empty() {
+            nothing_to_do();
+            ui::blank();
+            return Ok(());
+        }
     }
     if o.dry {
         ui::heading("Would change installation reasons", &ui::count(targets.len(), "package", "packages"));
@@ -464,11 +663,17 @@ fn orphans(db: &Alpm, o: &Options) -> Result<()> {
             ui::print(&format!("{}\n", ui::safe(&p.name)));
         }
         ui::release();
-        return Ok(());
+        return if packages.is_empty() && o.command == Command::Orphans { errors::fail(Kind::NothingFound) } else { Ok(()) };
     }
     if packages.is_empty() {
-        ui::note(NoteKind::Success, "No orphaned dependencies.");
-        return Ok(());
+        nothing_to_do();
+        // orphans exits 1 here, as pacman -Qdt does, so this is no ✓.
+        let (kind, text) = if o.command == Command::Orphans { (NoteKind::Info, "No orphaned dependencies.") } else { (NoteKind::Success, "Nothing to remove: no orphaned dependencies.") };
+        ui::blank();
+        ui::note(kind, text);
+        ui::blank();
+        // As pacman -Qdt, listing nothing exits 1; autoremove simply has nothing to do.
+        return if o.command == Command::Orphans { errors::fail(Kind::NothingFound) } else { Ok(()) };
     }
     let title = if o.command == Command::Orphans {
         "Orphaned dependencies"
@@ -537,7 +742,8 @@ mod tests {
         let b = query::installed(&db, "jdk-b").unwrap().clone();
         // jdk-b still provides java-runtime: nothing breaks.
         assert!(broken_by(&db, std::slice::from_ref(&a)).is_empty());
-        assert_eq!(vec!["app needs java-runtime".to_string()], broken_by(&db, &[a, b]));
+        let broken = Broken { dependant: "app".into(), depend: "java-runtime".into(), target: "jdk-a".into() };
+        assert_eq!(vec![broken], broken_by(&db, &[a, b]));
     }
 
     #[test]

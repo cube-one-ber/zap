@@ -1,7 +1,7 @@
 //! Read-only views of the repositories, the AUR and the installed system.
 use crate::alpm::{self, Alpm, PkgRef};
 use crate::aur;
-use crate::cli::{Command, Options, Scope, SortBy};
+use crate::cli::{Command, Options, Scope, SearchBy, SortBy};
 use crate::errors::{self, Kind, Result};
 use crate::libalpm::{db::find_first, db::parallel_map, vercmp, Pkg};
 use crate::ui::{self, Badge, Cell, Column, Entry, NoteKind, Table, Tone};
@@ -23,25 +23,84 @@ fn held<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// How many results `search` shows per section; --quiet and `select` list all.
+const SEARCH_SHOWN: usize = 20;
+/// select numbers at most this many results per section; more would scroll
+/// the best matches out of sight above the prompt.
+const SELECT_SHOWN: usize = 50;
+
+/// A note for the results a section left out.
+/// A section heading's count, with its ordering when there is anything to order.
+fn ordered(count: String, empty: bool, order: &str) -> String {
+    if empty { "no matches".to_string() } else { format!("{count} · {order}") }
+}
+
+/// An AUR package's votes, with its popularity when that is not zero.
+pub fn votes(p: &aur::Package) -> String {
+    let votes = ui::count(p.NumVotes.max(0) as usize, "vote", "votes");
+    if p.Popularity < 0.005 { votes } else { format!("{votes} · popularity {}", ui::fixed(p.Popularity, 2)) }
+}
+
+/// Say how many matches a section left out, and how to list them all.
+/// `source` is the flag for that section, --repo or --aur.
+fn more_results(left_out: usize, term: &str, source: &str) {
+    if left_out > 0 {
+        let more = ui::count(left_out, "more match", "more matches");
+        ui::note(NoteKind::Info, &format!("{more} not shown. Use a longer term, or zap search {term} {source} --quiet to list them all."));
+    }
+}
+
 /// Search the repositories and the AUR as the scope allows. Results are
 /// numbered repositories first; `select` shows them with number 1 last, so
 /// the best matches sit next to the prompt.
 pub fn search(db: &Alpm, o: &Options) -> Result<Vec<Match>> {
     let term = o.names.join(" ");
     let numbered = o.command == Command::Select;
-    // The AUR request and the repository scan overlap.
+    // Several words must all match, as in pacman -Ss. The AUR takes one
+    // term, so it gets the longest and its results are filtered by the rest.
+    let words: Vec<&str> = o.names.iter().map(String::as_str).collect();
+    let longest = words.iter().copied().max_by_key(|w| w.len()).unwrap_or_default();
+    let by_text = matches!(o.search_by, SearchBy::Name | SearchBy::NameDesc);
+    let aur_search = || -> Result<Vec<aur::Package>> {
+        let found = aur::search(if by_text { longest } else { &term }, o.search_by)?;
+        Ok(found.into_iter().filter(|p| !by_text || words.iter().all(|w| aur_matches(p, w, o.search_by))).collect())
+    };
+    // The AUR request and the repository scan overlap. The request can
+    // take a while, so say what the wait is for.
+    if o.scope != Scope::Repo {
+        ui::status("Searching the AUR…");
+    }
     let (repo_packages, aur_packages) = std::thread::scope(|s| {
-        let remote = (o.scope != Scope::Repo).then(|| s.spawn(|| aur::search(&term, o.search_by)));
-        let local = if o.scope != Scope::Aur { repository_search(db, &term, false) } else { Ok(Vec::new()) };
+        let remote = (o.scope != Scope::Repo).then(|| s.spawn(aur_search));
+        let local = if o.scope != Scope::Aur { repository_search(db, &words, false) } else { Ok(Vec::new()) };
         let remote = remote.map(|h| h.join().expect("AUR search panicked")).unwrap_or(Ok(Vec::new()));
         (local, remote)
     });
     let mut repo_packages = repo_packages?;
-    let mut aur_packages = aur_packages?;
-    // The name you typed comes first, then names that start with it; the
-    // sort is stable, so repositories keep their configured order after that.
-    repo_packages.sort_by_key(|p| closeness(&p.name, &term));
+    // A term the AUR refuses to search, as too broad or too short: the
+    // repository results still show, with the exact name from the AUR.
+    let refused = match &aur_packages {
+        Err(e) if e.kind == Kind::TooManyAurResults => Some(("too many matches to list", format!("The AUR has too many matches for {longest}. Use a longer, more specific word."))),
+        Err(e) if e.kind == Kind::AurTermTooShort => Some(("term too short", "The AUR searches only terms of at least 2 characters.".to_string())),
+        _ => None,
+    };
+    let too_many = refused.is_some();
+    let mut aur_packages = if too_many { aur::find(&term)?.into_iter().collect() } else { aur_packages? };
+    // The name you typed comes first, then names that start with it, then
+    // other names that contain it, each shortest first.
+    repo_packages.sort_by(|a, b| {
+        let near = closeness(&a.name, &term).cmp(&closeness(&b.name, &term));
+        near.then(a.name.len().cmp(&b.name.len())).then_with(|| a.name.cmp(&b.name))
+    });
     aur_packages.sort_by(|a, b| aur_order(a, b, &term, o.sort_by));
+    // Only numbered results can be selected, so select drops the rest.
+    let (mut repo_left, mut aur_left) = (0, 0);
+    if numbered {
+        repo_left = repo_packages.len().saturating_sub(SELECT_SHOWN);
+        aur_left = aur_packages.len().saturating_sub(SELECT_SHOWN);
+        repo_packages.truncate(SELECT_SHOWN);
+        aur_packages.truncate(SELECT_SHOWN);
+    }
 
     let matches: Vec<Match> = repo_packages
         .iter()
@@ -49,55 +108,80 @@ pub fn search(db: &Alpm, o: &Options) -> Result<Vec<Match>> {
         .chain(aur_packages.iter().map(|p| Match { name: p.Name.clone(), source: Scope::Aur }))
         .collect();
     if o.quiet {
-        held(|| matches.iter().for_each(|m| ui::print(&format!("{}\n", ui::safe(&m.name)))));
+        // Prefixed, as zap install takes them: a name can be in both sources.
+        let names = repo_packages.iter().map(|p| format!("{}/{}", alpm::repository(p), p.name)).chain(aur_packages.iter().map(|p| format!("aur/{}", p.Name)));
+        held(|| names.for_each(|name| ui::print(&format!("{}\n", ui::safe(&name)))));
+        // The names stay clean for scripts; the gap in them goes to stderr.
+        if let Some((detail, why)) = &refused {
+            ui::problem(NoteKind::Warning, &format!("The AUR refused the search: {detail}"), why);
+        }
         return Ok(matches);
     }
 
     let sections = if numbered { [Scope::Aur, Scope::Repo] } else { [Scope::Repo, Scope::Aur] };
+    // Hiding only a few results saves nothing, so a short overflow is shown.
+    let shown = |len: usize| if numbered || len <= SEARCH_SHOWN + 3 { len } else { SEARCH_SHOWN };
     for section in sections {
         if section == Scope::Repo && o.scope != Scope::Aur {
-            ui::heading("Repositories", &ui::count(repo_packages.len(), "match", "matches"));
-            for i in 0..repo_packages.len() {
+            // select lists bottom-up, so the best match sits by the prompt.
+            let order = if numbered { "closest names last" } else { "closest names first" };
+            ui::heading("Repositories", &ordered(ui::count(repo_packages.len(), "match", "matches"), repo_packages.is_empty(), order));
+            for i in 0..shown(repo_packages.len()) {
                 let at = if numbered { repo_packages.len() - 1 - i } else { i };
                 ui::entry(&repo_entry(db, &repo_packages[at], numbered.then_some(at + 1)));
             }
-            if repo_packages.is_empty() {
-                ui::note(NoteKind::Info, "Nothing in the configured repositories matches.");
-            }
+            more_results(repo_left + repo_packages.len() - shown(repo_packages.len()), &term, "--repo");
         }
         if section == Scope::Aur && o.scope != Scope::Repo {
-            let detail = format!(
-                "{} · closest names first, then by {}",
-                ui::count(aur_packages.len(), "match", "matches"),
-                o.sort_by.name()
-            );
+            let detail = if let Some((detail, _)) = &refused {
+                // aur::find looked up the term as an exact package name instead.
+                if aur_packages.is_empty() { detail.to_string() } else { format!("{detail} · exact name only") }
+            } else {
+                ordered(ui::count(aur_packages.len(), "match", "matches"), aur_packages.is_empty(), &format!("closest names {}, then by {}", if numbered { "last" } else { "first" }, o.sort_by.name()))
+            };
             ui::heading("AUR", &detail);
-            for i in 0..aur_packages.len() {
+            for i in 0..shown(aur_packages.len()) {
                 let at = if numbered { aur_packages.len() - 1 - i } else { i };
                 ui::entry(&aur_entry(db, &aur_packages[at], numbered.then_some(repo_packages.len() + at + 1)));
             }
-            if aur_packages.is_empty() {
-                ui::note(NoteKind::Info, "Nothing in the AUR matches.");
+            more_results(aur_left + aur_packages.len() - shown(aur_packages.len()), &term, "--aur");
+            if let Some((_, why)) = &refused {
+                let fallback = if aur_packages.is_empty() { String::new() } else { format!(" Only the package named exactly {term} is shown.") };
+                ui::note(NoteKind::Warning, &format!("{why}{fallback}"));
             }
         }
     }
     ui::blank();
-    if matches.is_empty() {
+    if matches.is_empty() && !too_many {
         ui::note(NoteKind::Info, "Try a shorter or broader term.");
     } else if !numbered {
-        ui::note(NoteKind::Info, "zap info NAME shows details · zap select TERM installs from this list.");
+        // The same scope, so select lists what was just shown.
+        let flag = match o.scope { Scope::Aur => " --aur", Scope::Repo => " --repo", _ => "" };
+        let term = o.names.join(" ");
+        ui::note(NoteKind::Info, &format!("Next: zap info NAME for details, or zap select {term}{flag} to choose and install."));
+    }
+    // select asks its question right under the results.
+    if !numbered {
+        ui::separate();
     }
     Ok(matches)
 }
 
-/// 0 for the exact name, 1 for a name that starts with the term, 2 otherwise.
+/// How closely a name matches a search term of one or more words: 0 for the
+/// exact name, 1 for a name that starts with the first word and contains the
+/// rest, 2 for a name that contains every word, 3 for a description match.
 fn closeness(name: &str, term: &str) -> u8 {
+    let mut words = term.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    let rest = words.all(|w| name.contains(w));
     if name == term {
         0
-    } else if name.starts_with(term) {
+    } else if name.starts_with(first) && rest {
         1
-    } else {
+    } else if name.contains(first) && rest {
         2
+    } else {
+        3
     }
 }
 
@@ -153,7 +237,13 @@ fn repo_page(p: &Pkg) -> String {
 }
 
 fn aur_entry(db: &Alpm, p: &aur::Package, index: Option<usize>) -> Entry {
-    let mut badges: Vec<Badge> = installed_badge(db, &p.Name, &p.Version).into_iter().collect();
+    // An installed repository package is not updated from the AUR, so its
+    // version is no "update available" here.
+    let from = db.installed_pkg(&p.Name).and_then(|_| db.h.syncdbs.iter().find(|d| d.get(&p.Name).is_some()));
+    let mut badges: Vec<Badge> = match (from, db.installed_pkg(&p.Name)) {
+        (Some(repo), Some(installed)) => vec![Badge { text: format!("installed {} from {}", installed.version, repo.name), tone: Tone::Muted }],
+        _ => installed_badge(db, &p.Name, &p.Version).into_iter().collect(),
+    };
     if p.OutOfDate.is_some() {
         badges.push(Badge { text: "! out of date".into(), tone: Tone::Warning });
     }
@@ -169,9 +259,8 @@ fn aur_entry(db: &Alpm, p: &aur::Package, index: Option<usize>) -> Entry {
         badges,
         description: p.Description.clone().unwrap_or_default(),
         meta: format!(
-            "{} · popularity {} · {} · updated {}",
-            ui::count(p.NumVotes.max(0) as usize, "vote", "votes"),
-            ui::fixed(p.Popularity, 2),
+            "{} · {} · updated {}",
+            votes(p),
             p.Maintainer.as_deref().unwrap_or("no maintainer"),
             ui::date(p.LastModified)
         ),
@@ -181,15 +270,24 @@ fn aur_entry(db: &Alpm, p: &aur::Package, index: Option<usize>) -> Entry {
 /// Packages whose name or description matches, from the local database or
 /// from every repository that allows searching. The first repository to
 /// carry a name wins, as it does for installation.
-pub fn repository_search(db: &Alpm, term: &str, local: bool) -> Result<Vec<PkgRef>> {
+/// Whether an AUR result contains `word`, ignoring case, in its name or,
+/// when searching by name and description, its description.
+fn aur_matches(p: &aur::Package, word: &str, by: SearchBy) -> bool {
+    let word = word.to_lowercase();
+    p.Name.to_lowercase().contains(&word)
+        || (by == SearchBy::NameDesc && p.Description.as_deref().is_some_and(|d| d.to_lowercase().contains(&word)))
+}
+
+/// Packages matching every word, as pacman -Ss and -Qs find them.
+pub fn repository_search(db: &Alpm, words: &[&str], local: bool) -> Result<Vec<PkgRef>> {
     if local {
-        return db.local_db().search(&[term]).map_err(|e| Alpm::failed(&e));
+        return db.local_db().search(words).map_err(|e| Alpm::failed(&e));
     }
     db.load_sync();
     let mut seen = std::collections::HashSet::new();
     let mut packages = Vec::new();
     for database in &db.h.syncdbs {
-        for p in database.search(&[term]).map_err(|e| Alpm::failed(&e))? {
+        for p in database.search(words).map_err(|e| Alpm::failed(&e))? {
             if seen.insert(p.name.clone()) {
                 packages.push(p);
             }
@@ -199,10 +297,13 @@ pub fn repository_search(db: &Alpm, term: &str, local: bool) -> Result<Vec<PkgRe
 }
 
 pub fn local_search(db: &Alpm, o: &Options) -> Result<()> {
-    let packages = repository_search(db, &o.names.join(" "), true)?;
+    let words: Vec<&str> = o.names.iter().map(String::as_str).collect();
+    let packages = repository_search(db, &words, true)?;
+    // As pacman -Qs, finding nothing exits 1.
+    let found = || if packages.is_empty() { errors::fail(Kind::NothingFound) } else { Ok(()) };
     if o.quiet {
         held(|| packages.iter().for_each(|p| ui::print(&format!("{}\n", ui::safe(&p.name)))));
-        return Ok(());
+        return found();
     }
     ui::heading("Installed", &ui::count(packages.len(), "match", "matches"));
     for p in &packages {
@@ -225,7 +326,7 @@ pub fn local_search(db: &Alpm, o: &Options) -> Result<()> {
         ui::note(NoteKind::Info, "No installed package matches.");
     }
     ui::blank();
-    Ok(())
+    found()
 }
 
 /// Parse a reply such as `1 3-5, 7` into unique zero-based indices. Numbers
@@ -248,7 +349,7 @@ pub fn selection(reply: &str, count: usize) -> Result<Vec<usize>> {
         }
     }
     if selected.is_empty() {
-        return errors::fail(Kind::Cancelled);
+        return errors::fail(Kind::Declined);
     }
     Ok(selected)
 }
@@ -260,20 +361,44 @@ pub fn installed<'a>(db: &'a Alpm, name: &str) -> Result<&'a PkgRef> {
     db.installed_pkg(name).ok_or_else(|| errors::with(Kind::PackageNotInstalled, name))
 }
 
+/// Show each name in turn, as pacman -Qi does: a name that is not found is
+/// reported and skipped, and the command exits 1 at the end.
+fn each_name<S: AsRef<str>>(names: &[S], mut show: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    const NOT_FOUND: [Kind; 4] = [Kind::PackageNotInstalled, Kind::PackageNotFound, Kind::AurPackageNotFound, Kind::RepositoryPackageNotFound];
+    let mut failed = false;
+    for name in names {
+        match show(name.as_ref()) {
+            Err(e) if NOT_FOUND.contains(&e.kind) => {
+                errors::report(&e);
+                failed = true;
+            }
+            result => result?,
+        }
+    }
+    // Each one was reported already.
+    if failed { errors::fail(Kind::NothingFound) } else { Ok(()) }
+}
+
 pub fn info(db: &Alpm, o: &Options) -> Result<()> {
-    for name in &o.names {
+    each_name(&o.names, |name| info_one(db, o, name))
+}
+
+fn info_one(db: &Alpm, o: &Options, name: &str) -> Result<()> {
+    {
         if o.command == Command::Localinfo {
             package_details(db, installed(db, name)?, true);
-            continue;
+            return Ok(());
         }
-        let repo_package = if o.scope == Scope::Aur { None } else { db.repo(name) };
+        // aur/NAME asks for the AUR package even when a repository has one.
+        let scope = if util::contains(&o.aur_names, name) { Scope::Aur } else { o.scope };
+        let repo_package = if scope == Scope::Aur { None } else { db.repo(name) };
         if let Some(p) = repo_package {
             package_details(db, &p, false);
-        } else if o.scope == Scope::Repo {
-            return Err(errors::with(Kind::RepositoryPackageNotFound, name.as_str()));
+        } else if scope == Scope::Repo {
+            return Err(errors::with(Kind::RepositoryPackageNotFound, name));
         } else {
-            let kind = if o.scope == Scope::Aur { Kind::AurPackageNotFound } else { Kind::PackageNotFound };
-            let p = aur::find(name)?.ok_or_else(|| errors::with(kind, name.as_str()))?;
+            let kind = if scope == Scope::Aur { Kind::AurPackageNotFound } else { Kind::PackageNotFound };
+            let p = aur::find(name)?.ok_or_else(|| crate::builder::lowercase_hint(db, errors::with(kind, name), name))?;
             aur_details(db, &p);
         }
     }
@@ -283,7 +408,7 @@ pub fn info(db: &Alpm, o: &Options) -> Result<()> {
 fn package_details(db: &Alpm, p: &Pkg, local: bool) {
     let info = p.info();
     let badges = if local { Vec::new() } else { installed_badge(db, &p.name, &p.version).into_iter().collect() };
-    ui::blank();
+    ui::separate();
     ui::entry(&Entry {
         source: if local { "local".into() } else { alpm::repository(p).into() },
         name: p.name.clone(),
@@ -297,7 +422,8 @@ fn package_details(db: &Alpm, p: &Pkg, local: bool) {
     ui::field_list("Licenses", &info.licenses);
     ui::field_list("Groups", &info.groups);
     ui::field_optional("Architecture", &info.arch);
-    ui::field_optional("Packager", &info.packager);
+    // makepkg's placeholder is no name.
+    ui::field_optional("Packager", if info.packager == "Unknown Packager" { "" } else { info.packager.as_str() });
     ui::field("Built", &ui::dated(info.builddate));
     if local {
         ui::field("Installed", &ui::dated(info.installdate));
@@ -335,7 +461,7 @@ fn optionals(db: &Alpm, deps: &[String]) -> Vec<String> {
 fn aur_details(db: &Alpm, p: &aur::Package) {
     let mut entry = aur_entry(db, p, None);
     entry.meta.clear();
-    ui::blank();
+    ui::separate();
     ui::entry(&entry);
     ui::blank();
     ui::field_optional("URL", p.URL.as_deref().unwrap_or(""));
@@ -345,7 +471,7 @@ fn aur_details(db: &Alpm, p: &aur::Package) {
     }
     ui::field_list("Licenses", &p.License);
     ui::field("Maintainer", p.Maintainer.as_deref().unwrap_or("none (orphaned)"));
-    ui::field("Votes", &format!("{} · popularity {}", p.NumVotes, ui::fixed(p.Popularity, 2)));
+    ui::field("Votes", &votes(p));
     ui::field("First submitted", &ui::dated(p.FirstSubmitted));
     ui::field("Last modified", &ui::dated(p.LastModified));
     if let Some(flagged) = p.OutOfDate {
@@ -364,9 +490,8 @@ fn aur_details(db: &Alpm, p: &aur::Package) {
 
 /// `list` and `foreign`: every installed package, or only the named ones.
 pub fn list(db: &Alpm, o: &Options) -> Result<()> {
-    for name in &o.names {
-        installed(db, name)?;
-    }
+    // As pacman -Q: list what is installed, then fail on the first name that is not.
+    let absent = o.names.iter().find(|name| installed(db, name).is_err());
     let foreign = o.command == Command::Foreign;
     let shown: Vec<&PkgRef> = db
         .installed()
@@ -379,9 +504,20 @@ pub fn list(db: &Alpm, o: &Options) -> Result<()> {
     } else {
         shown
     };
+    // As pacman -Qm, finding no foreign package exits 1.
+    let missing = || {
+        absent.map_or(Ok(()), |name| installed(db, name).map(drop))?;
+        if foreign && shown.is_empty() { errors::fail(Kind::NothingFound) } else { Ok(()) }
+    };
     if o.quiet {
         held(|| shown.iter().for_each(|p| ui::print(&format!("{}\n", ui::safe(&p.name)))));
-        return Ok(());
+        return missing();
+    }
+    if shown.is_empty() && !o.names.is_empty() {
+        if foreign && absent.is_none() {
+            ui::note(NoteKind::Info, &format!("{} comes from a configured repository.", o.names.join(", ")));
+        }
+        return missing();
     }
     db.local_db().preload();
     let mut table = Table::new(&[
@@ -418,7 +554,7 @@ pub fn list(db: &Alpm, o: &Options) -> Result<()> {
         }
         ui::blank();
     });
-    Ok(())
+    missing()
 }
 
 /// Whether a path recorded in a package can be joined to the root directory
@@ -444,18 +580,22 @@ pub fn file_entries(p: &Pkg) -> Result<&[crate::libalpm::package::File]> {
 
 pub fn files<S: AsRef<str>>(db: &Alpm, names: &[S], quiet: bool) -> Result<()> {
     held(|| {
-        for name in names {
-            let name = name.as_ref();
-            for file in file_entries(installed(db, name)?)? {
-                let path = ui::safe(&file_path(db, &file.name)?);
-                if quiet {
-                    ui::print(&format!("{path}\n"));
-                } else {
-                    ui::print(&format!("{}{}{} {path}\n", ui::style(Tone::Bold), ui::safe(name), ui::reset()));
+        each_name(names, |name| {
+            // Files only: the directories a package creates are left out.
+            let files: Vec<_> = file_entries(installed(db, name)?)?.iter().filter(|f| !f.name.ends_with('/')).collect();
+            if quiet {
+                for file in files {
+                    ui::print(&format!("{}\n", ui::safe(&file_path(db, &file.name)?)));
                 }
+                return Ok(());
             }
-        }
-        Ok(())
+            ui::heading(name, &ui::count(files.len(), "file", "files"));
+            for file in files {
+                ui::line(&file_path(db, &file.name)?, 2, Tone::Plain);
+            }
+            ui::blank();
+            Ok(())
+        })
     })
 }
 
@@ -497,6 +637,31 @@ fn owner<'a>(db: &'a Alpm, path: &str) -> Result<Option<&'a PkgRef>> {
     }
 }
 
+/// Every installed package that records `path`, in database order. A
+/// directory is usually shared, so all of them are owners.
+fn all_owners<'a>(db: &'a Alpm, path: &str) -> Result<Vec<&'a PkgRef>> {
+    let pkgs = db.installed();
+    let mut found = Vec::new();
+    for (p, records) in pkgs.iter().zip(parallel_map(pkgs, |p| p.records_file(path))) {
+        match records {
+            Some(true) => found.push(p),
+            Some(false) => {}
+            None => return errors::fail(Kind::InvalidPackageFile),
+        }
+    }
+    Ok(found)
+}
+
+/// A bare command name such as `ls`, found on PATH as `pacman -Qo` does,
+/// unless a file of that name is in the current directory.
+fn command_path(input: &str) -> Option<String> {
+    if input.contains('/') || std::fs::symlink_metadata(input).is_ok() {
+        return None;
+    }
+    let path = std::env::var("PATH").ok()?;
+    path.split(':').filter(|dir| dir.starts_with('/')).map(|dir| crate::util::join(dir, input)).find(|candidate| std::path::Path::new(candidate).is_file())
+}
+
 pub fn owners<S: AsRef<str>>(db: &Alpm, paths: &[S], quiet: bool) -> Result<()> {
     let mut unowned = 0;
     let mut absent = 0;
@@ -506,25 +671,41 @@ pub fn owners<S: AsRef<str>>(db: &Alpm, paths: &[S], quiet: bool) -> Result<()> 
         Column::new("Version").tone(Tone::Success),
         Column::new("Status"),
     ]);
-    for input in paths {
-        let input = input.as_ref();
-        let found = match recorded_path(db, input)? {
-            Some(recorded) => owner(db, &recorded)?,
-            None => None,
+    for typed in paths {
+        let typed = typed.as_ref();
+        let on_path = command_path(typed);
+        let input = on_path.as_deref().unwrap_or(typed);
+        // A command found on PATH shows both what was typed and what it is.
+        let shown = if on_path.is_some() { format!("{typed} → {input}") } else { input.to_string() };
+        let directory = std::fs::metadata(input).is_ok_and(|m| m.is_dir());
+        let found: Vec<&PkgRef> = match recorded_path(db, input)? {
+            Some(recorded) if directory => all_owners(db, &recorded)?,
+            Some(recorded) => owner(db, &recorded)?.into_iter().collect(),
+            None => Vec::new(),
         };
-        if let Some(p) = found {
+        if let [p] = found.as_slice() {
             if quiet {
                 ui::print(&format!("{}\n", ui::safe(&p.name)));
             }
-            table.add_text(&[input, &p.name, &p.version, ""]);
+            table.add_text(&[&shown, &p.name, &p.version, "owned"]);
+        } else if !found.is_empty() {
+            let names: Vec<&str> = found.iter().map(|p| p.name.as_str()).collect();
+            if quiet {
+                ui::print(&format!("{}\n", ui::safe(&names.join("\n"))));
+            }
+            table.add_text(&[&shown, "—", "—", &format!("directory shared by {}", ui::count(names.len(), "package", "packages"))]);
         } else {
             unowned += 1;
             // A path that does not exist is a different problem from a stray file.
             let exists = std::fs::symlink_metadata(input).is_ok();
             absent += !exists as usize;
-            let status = if exists { "not owned by any package" } else { "does not exist" };
+            let status = match (exists, typed.contains('/')) {
+                (true, _) => "not owned by any package",
+                (false, true) => "does not exist",
+                (false, false) => "not a file here or a command on PATH",
+            };
             table.add(vec![
-                Cell::new(input),
+                Cell::new(shown),
                 Cell::toned("—", Tone::Muted),
                 Cell::toned("—", Tone::Muted),
                 Cell::toned(status, if exists { Tone::Danger } else { Tone::Warning }),
@@ -532,7 +713,7 @@ pub fn owners<S: AsRef<str>>(db: &Alpm, paths: &[S], quiet: bool) -> Result<()> 
         }
     }
     if !quiet {
-        ui::heading("File owners", &ui::count(paths.len(), "file", "files"));
+        ui::heading("File owners", &ui::count(paths.len(), "path", "paths"));
         table.render();
     }
     if unowned > 0 {
@@ -543,7 +724,7 @@ pub fn owners<S: AsRef<str>>(db: &Alpm, paths: &[S], quiet: bool) -> Result<()> 
                 ui::note(NoteKind::Warning, &format!("{count} not owned by any installed package."));
             }
             if absent > 0 {
-                ui::note(NoteKind::Warning, &format!("{} not exist.", ui::count(absent, "path does", "paths do")));
+                ui::note(NoteKind::Warning, &format!("{} not found.", ui::count(absent, "target was", "targets were")));
             }
             ui::blank();
         }
@@ -559,7 +740,8 @@ pub fn owners<S: AsRef<str>>(db: &Alpm, paths: &[S], quiet: bool) -> Result<()> 
 struct Checked {
     files: usize,
     absent: Vec<String>,
-    hidden: usize,
+    /// Paths in directories this user cannot search.
+    hidden: Vec<String>,
 }
 
 /// Look for each recorded file of one package under `root`. File lists are
@@ -568,7 +750,7 @@ struct Checked {
 fn check_package(p: &Pkg, root: &str) -> Result<Checked> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let entries = file_entries(p)?;
-    let mut checked = Checked { files: entries.len(), absent: Vec::new(), hidden: 0 };
+    let mut checked = Checked { files: entries.len(), absent: Vec::new(), hidden: Vec::new() };
     // The directory last opened, and its descriptor or the errno opening it gave.
     let mut current: Option<(&str, std::result::Result<OwnedFd, i32>)> = None;
     let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
@@ -601,7 +783,7 @@ fn check_package(p: &Pkg, root: &str) -> Result<Checked> {
         let shown = format!("{root}/{recorded}");
         match failure {
             libc::ENOENT | libc::ENOTDIR => checked.absent.push(shown),
-            libc::EACCES => checked.hidden += 1,
+            libc::EACCES => checked.hidden.push(shown),
             _ => return Err(errors::with(Kind::FileInspectionFailed, shown)),
         }
     }
@@ -611,9 +793,17 @@ fn check_package(p: &Pkg, root: &str) -> Result<Checked> {
 /// Check that installed files exist. Contents are not verified. Files in
 /// directories this user cannot search are counted, not treated as missing.
 pub fn check<S: AsRef<str>>(db: &Alpm, names: &[S]) -> Result<()> {
-    for name in names {
-        installed(db, name.as_ref())?;
+    // Names that are not installed are reported, and the rest still checked.
+    let found: Vec<&str> = names.iter().map(AsRef::as_ref).filter(|name| db.installed_pkg(name).is_some()).collect();
+    let absent = names.len() - found.len();
+    if absent > 0 {
+        let missing: Vec<&str> = names.iter().map(AsRef::as_ref).filter(|name| !found.contains(name)).collect();
+        each_name(&missing, |name| installed(db, name).map(drop)).ok();
+        if found.is_empty() {
+            return errors::fail(Kind::NothingFound);
+        }
     }
+    let names = &found;
     let root = db.cfg.root.trim_end_matches('/');
     let heading = if names.is_empty() { "all packages".into() } else { ui::count(names.len(), "package", "packages") };
     ui::heading("Installed files", &heading);
@@ -623,14 +813,18 @@ pub fn check<S: AsRef<str>>(db: &Alpm, names: &[S]) -> Result<()> {
         .filter(|p| names.is_empty() || util::contains(names, &p.name))
         .collect();
     // Packages are checked in parallel and reported in database order.
+    if selected.len() > 1 {
+        ui::status(&format!("Checking the files of {}…", ui::count(selected.len(), "package", "packages")));
+    }
     let results = parallel_map(&selected, |p| check_package(p, root));
-    let (mut packages, mut total, mut missing, mut unreadable) = (0, 0, 0, 0);
+    let (mut packages, mut total, mut missing) = (0, 0, 0);
+    let mut unreadable = Vec::new();
     for (p, result) in selected.iter().zip(results) {
         let checked = result?;
         packages += 1;
         total += checked.files;
         missing += checked.absent.len();
-        unreadable += checked.hidden;
+        unreadable.extend(checked.hidden.iter().cloned());
         if !checked.absent.is_empty() {
             let files = ui::count(checked.files, "file", "files");
             ui::note(NoteKind::Failure, &format!("{} · {} of {files} missing", p.name, checked.absent.len()));
@@ -638,9 +832,9 @@ pub fn check<S: AsRef<str>>(db: &Alpm, names: &[S]) -> Result<()> {
                 ui::line(path, 6, Tone::Muted);
             }
         } else if !names.is_empty() {
-            let present = ui::count(checked.files - checked.hidden, "file", "files");
-            if checked.hidden > 0 {
-                let message = format!("{} · {present} present, {} not visible to your user", p.name, checked.hidden);
+            let present = ui::count(checked.files - checked.hidden.len(), "file", "files");
+            if !checked.hidden.is_empty() {
+                let message = format!("{} · {present} present, {} not visible to your user", p.name, checked.hidden.len());
                 ui::note(NoteKind::Warning, &message);
             } else {
                 ui::note(NoteKind::Success, &format!("{} · {present} present", p.name));
@@ -648,22 +842,36 @@ pub fn check<S: AsRef<str>>(db: &Alpm, names: &[S]) -> Result<()> {
         }
     }
     if names.len() != 1 {
+        let unchecked = if unreadable.is_empty() { String::new() } else { format!(" · {} not checked", ui::grouped(unreadable.len())) };
         let summary = format!(
-            "Checked {} · {} · {missing} missing",
+            "Checked {} · {} · {} missing{unchecked}",
             ui::count(packages, "package", "packages"),
-            ui::count(total, "file", "files")
+            ui::count(total, "file", "files"),
+            ui::grouped(missing)
         );
-        ui::note(if missing == 0 { NoteKind::Success } else { NoteKind::Failure }, &summary);
-        if unreadable > 0 {
-            let count = ui::count(unreadable, "file", "files");
-            ui::note(NoteKind::Info, &format!("{count} in directories your user cannot read could not be checked."));
+        // Files hidden from this user leave the check incomplete, not
+        // failed; the note below says so.
+        let kind = if missing == 0 { NoteKind::Success } else { NoteKind::Failure };
+        ui::note(kind, &summary);
+        if !unreadable.is_empty() {
+            let count = ui::count(unreadable.len(), "file is", "files are");
+            ui::note(NoteKind::Info, &format!("{count} in directories your user cannot read; run pacman -Qk as root to check them:"));
+            // Listed by directory, so a locked directory is one line however many files it holds.
+            let mut directories = std::collections::BTreeMap::new();
+            for path in &unreadable {
+                let directory = path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
+                *directories.entry(directory.to_string()).or_insert(0) += 1;
+            }
+            for (directory, files) in directories {
+                ui::line(&format!("{directory} · {}", ui::count(files, "file", "files")), 6, Tone::Muted);
+            }
         }
     }
     ui::blank();
     if missing != 0 {
         return errors::fail(Kind::MissingInstalledFiles);
     }
-    Ok(())
+    if absent > 0 { errors::fail(Kind::NothingFound) } else { Ok(()) }
 }
 
 pub fn stats(db: &Alpm) -> Result<()> {
@@ -687,7 +895,7 @@ pub fn stats(db: &Alpm) -> Result<()> {
         ("Orphans", orphans.len()),
     ];
     for (label, value) in counts {
-        ui::field(label, &value.to_string());
+        ui::field(label, &ui::grouped(value));
     }
     ui::field("Installed size", &ui::size(size));
 
@@ -733,7 +941,7 @@ mod tests {
         for input in ["0", "6", "3-1", "1-9999999999", "-1", "all", "1;id"] {
             assert_eq!(Kind::InvalidSelection, selection(input, 5).unwrap_err().kind, "{input}");
         }
-        assert_eq!(Kind::Cancelled, selection("", 5).unwrap_err().kind);
+        assert_eq!(Kind::Declined, selection("", 5).unwrap_err().kind);
     }
 
     #[test]
@@ -757,7 +965,11 @@ mod tests {
         packages.sort_by(|a, b| aur_order(a, b, "z", SortBy::Votes));
         assert_eq!("z", packages[0].Name);
         assert_eq!(1, closeness("ripgrep-all", "ripgrep"));
-        assert_eq!(2, closeness("repgrep", "ripgrep"));
+        assert_eq!(2, closeness("fast-ripgrep", "ripgrep"));
+        assert_eq!(3, closeness("repgrep", "ripgrep"));
+        // Every word in the name outranks a match in the description.
+        assert_eq!(1, closeness("ripgrep-all-git", "ripgrep all"));
+        assert_eq!(3, closeness("vgrep", "ripgrep all"));
     }
 
     #[test]
@@ -803,7 +1015,8 @@ mod tests {
         assert_eq!(Kind::FileNotOwned, owners(&db, &[missing], true).unwrap_err().kind);
         let nowhere = format!("{root}/no-such-directory/file");
         assert_eq!(Kind::FileNotOwned, owners(&db, &[nowhere], true).unwrap_err().kind);
-        assert_eq!(Kind::PackageNotInstalled, check(&db, &["absent"]).unwrap_err().kind);
+        // A name that is not installed is reported on its own; the check fails at the end.
+        assert_eq!(Kind::NothingFound, check(&db, &["absent"]).unwrap_err().kind);
         ui::end_capture();
     }
 

@@ -9,9 +9,87 @@ use super::sandbox;
 use super::{ErrorKind, Handle, Result};
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
+
+/// How far the current package download has got, across parallel workers,
+/// reported as one progress line. Bytes resumed from a `.part` are not
+/// counted, so the line stays below 100% until every file is in.
+struct Meter {
+    on: AtomicBool,
+    done: AtomicU64,
+    total: AtomicU64,
+    files: AtomicUsize,
+    finished: AtomicUsize,
+    shown: AtomicI32,
+    /// When the download started, in milliseconds since the epoch.
+    started: AtomicU64,
+}
+
+static METER: Meter = Meter {
+    on: AtomicBool::new(false),
+    done: AtomicU64::new(0),
+    total: AtomicU64::new(0),
+    files: AtomicUsize::new(0),
+    finished: AtomicUsize::new(0),
+    shown: AtomicI32::new(-1),
+    started: AtomicU64::new(0),
+};
+
+fn now_millis() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+impl Meter {
+    fn start(&self, total: u64, files: usize) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+        self.files.store(files, Ordering::Relaxed);
+        self.finished.store(0, Ordering::Relaxed);
+        self.shown.store(-1, Ordering::Relaxed);
+        self.started.store(now_millis(), Ordering::Relaxed);
+        self.on.store(true, Ordering::Relaxed);
+    }
+
+    /// Count `bytes` more, reporting only when the percentage moves.
+    fn add(&self, bytes: u64) {
+        if self.on.load(Ordering::Relaxed) {
+            self.done.fetch_add(bytes, Ordering::Relaxed);
+            self.report(false);
+        }
+    }
+
+    fn file_done(&self) {
+        if self.on.load(Ordering::Relaxed) {
+            self.finished.fetch_add(1, Ordering::Relaxed);
+            self.report(true);
+        }
+    }
+
+    fn report(&self, always: bool) {
+        let (files, finished) = (self.files.load(Ordering::Relaxed), self.finished.load(Ordering::Relaxed));
+        let (done, total) = (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
+        let percent = if finished >= files { 100 } else { (done * 100 / total.max(1)).min(99) as i32 };
+        if self.shown.fetch_max(percent, Ordering::Relaxed) >= percent && !always {
+            return;
+        }
+        // "12.0 of 193.6 MiB · 8.1 MiB/s", with the unit chosen by the total.
+        let (scale, unit) = match total.max(done) {
+            n if n < 1 << 20 => (1024.0, "KiB"),
+            n if n < 1 << 30 => (1024.0 * 1024.0, "MiB"),
+            _ => (1024.0 * 1024.0 * 1024.0, "GiB"),
+        };
+        let mut detail = if total == 0 { format!("{:.1} {unit}", done as f64 / scale) } else { format!("{:.1} of {:.1} {unit}", done.min(total) as f64 / scale, total as f64 / scale) };
+        let elapsed = now_millis().saturating_sub(self.started.load(Ordering::Relaxed));
+        if elapsed >= 1000 {
+            let rate = done as f64 / (elapsed as f64 / 1000.0);
+            let (scale, unit) = if rate < (1 << 20) as f64 { (1024.0, "KiB") } else { (1024.0 * 1024.0, "MiB") };
+            detail.push_str(&format!(" · {:.1} {unit}/s", rate / scale));
+        }
+        log::progress(log::Progress::Download, &detail, percent, files, finished);
+    }
+}
 
 /// One file to fetch.
 pub(crate) struct Payload {
@@ -165,6 +243,7 @@ fn copy_limited(from: &mut dyn Read, out: &mut std::fs::File, start: u64, max_si
             return Err(Failure::TooBig);
         }
         out.write_all(&buf[..n]).map_err(|e| Failure::Other(super::strerror(&e)))?;
+        METER.add(n as u64);
     }
 }
 
@@ -359,7 +438,12 @@ impl Handle {
     /// `curl_download_internal`: fetch the payloads into `dir`, the largest
     /// first, up to `parallel_downloads` at a time. After a failure no new
     /// downloads start; those never started count as failed.
-    fn fetch_all(&self, payloads: &[Payload], dir: &str, newer: &[Option<SystemTime>]) -> Vec<Option<Fetched>> {
+    /// Fetch every payload, `ParallelDownloads` at a time. With `progress`,
+    /// one line follows the bytes fetched against the payloads' sizes.
+    fn fetch_all(&self, payloads: &[Payload], dir: &str, newer: &[Option<SystemTime>], progress: bool) -> Vec<Option<Fetched>> {
+        if progress {
+            METER.start(payloads.iter().map(|p| p.max_size).sum(), payloads.len());
+        }
         let mut order: Vec<usize> = (0..payloads.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(payloads[i].max_size));
         let results: Vec<Mutex<Option<Fetched>>> = payloads.iter().map(|_| Mutex::new(None)).collect();
@@ -373,6 +457,8 @@ impl Handle {
             let fetched = self.fetch_payload(&payloads[i], dir, newer[i]);
             if fetched.is_none() {
                 stop.store(true, Ordering::Relaxed);
+            } else {
+                METER.file_done();
             }
             *results[i].lock().unwrap_or_else(|e| e.into_inner()) = fetched;
         };
@@ -386,6 +472,7 @@ impl Handle {
                 }
             });
         }
+        METER.on.store(false, Ordering::Relaxed);
         results.into_iter().map(|r| r.into_inner().unwrap_or_else(|e| e.into_inner())).collect()
     }
 
@@ -401,10 +488,12 @@ impl Handle {
                 (if_newer && !p.force && meta.len() != 0).then(|| meta.modified().ok()).flatten()
             })
             .collect();
+        // Databases refresh quietly; packages show how far they have got.
+        let progress = !if_newer;
         let results = if self.use_sandbox() {
-            self.download_sandboxed(payloads, dir, &newer)?
+            self.download_sandboxed(payloads, dir, &newer, progress)?
         } else {
-            self.fetch_all(payloads, dir, &newer)
+            self.fetch_all(payloads, dir, &newer, progress)
         };
         results.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| ErrorKind::Retrieve.into())
     }
@@ -414,7 +503,7 @@ impl Handle {
     /// user fetches into a temporary directory under `dir`, then the files
     /// move into `dir`, owned by root. Partial packages move both ways so
     /// they can resume.
-    fn download_sandboxed(&self, payloads: &[Payload], dir: &str, newer: &[Option<SystemTime>]) -> Result<Vec<Option<Fetched>>> {
+    fn download_sandboxed(&self, payloads: &[Payload], dir: &str, newer: &[Option<SystemTime>], progress: bool) -> Result<Vec<Option<Fetched>>> {
         let name = self.sandboxuser.as_deref().unwrap_or_default();
         let user = match sandbox::lookup_user(name) {
             Ok(Some(user)) => user,
@@ -449,7 +538,7 @@ impl Handle {
             }
         }
 
-        let (results, childsig) = self.run_sandbox_child(payloads, &tmp, newer, user);
+        let (results, childsig) = self.run_sandbox_child(payloads, &tmp, newer, progress, user);
         let mut results = results.unwrap_or_else(|| vec![None; payloads.len()]);
 
         // Move what the child fetched (or partly fetched) into place.
@@ -486,6 +575,7 @@ impl Handle {
         payloads: &[Payload],
         tmp: &str,
         newer: &[Option<SystemTime>],
+        progress: bool,
         user: sandbox::User,
     ) -> (Option<Vec<Option<Fetched>>>, Option<i32>) {
         let mut fds = [0; 2];
@@ -516,7 +606,7 @@ impl Handle {
                 log::error(&format!("switching to sandbox user '{}' failed!\n", self.sandboxuser.as_deref().unwrap_or_default()));
                 2
             } else {
-                let results = self.fetch_all(payloads, tmp, newer);
+                let results = self.fetch_all(payloads, tmp, newer, progress);
                 let bytes: Vec<u8> = results
                     .iter()
                     .map(|r| match r {

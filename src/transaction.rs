@@ -205,6 +205,7 @@ fn outcome(status: u8) -> Result<()> {
     match status {
         0 => Ok(()),
         errors::EXIT_CANCELLED => errors::fail(Kind::WorkerCancelled),
+        errors::EXIT_WORKER_DECLINED => errors::fail(Kind::WorkerDeclined),
         // Killed or crashed: nothing else has said so. run_status gives
         // 128 + N for signal N and 255 for any other abnormal end.
         129 | 131..=255 => Err(if status == 255 || status > 128 + 31 {
@@ -330,7 +331,22 @@ pub fn worker(bytes: &str) -> Result<()> {
 
     if request.operation == Operation::Upgrade {
         ui::heading("Refreshing repository databases", "");
-        db.h.db_update(false).map_err(|e| Alpm::failed(&e))?;
+        ui::status("Downloading the repository databases…");
+        let current = db.h.db_update(false).map_err(|e| Alpm::failed(&e))?;
+        // db_update reports, in order, whether each synced database was already current.
+        let synced = db.h.syncdbs.iter().filter(|d| d.usage & crate::libalpm::db::USAGE_SYNC != 0);
+        let (mut updated, mut fresh) = (Vec::new(), Vec::new());
+        for (d, was_current) in synced.zip(current) {
+            if was_current { &mut fresh } else { &mut updated }.push(d.name.as_str());
+        }
+        let mut parts = Vec::new();
+        if !updated.is_empty() {
+            parts.push(format!("{} updated", updated.join(", ")));
+        }
+        if !fresh.is_empty() {
+            parts.push(format!("{} already current", fresh.join(", ")));
+        }
+        ui::note(NoteKind::Success, &parts.join(" · "));
     }
     signals::check()?;
     // Take the normal lock. Another process's lock is never removed.
@@ -400,15 +416,26 @@ fn run_transaction(db: &mut Alpm, request: &Request, archives: &[Option<String>]
     let trans = db.h.trans();
     if trans.add.is_empty() && trans.remove.is_empty() {
         if reason_changes.is_empty() {
-            ui::note(NoteKind::Success, "Nothing to do: everything is up to date.");
+            // An upgrade goes on to the AUR, so this speaks for the repositories only.
+            let done = if request.operation == Operation::Upgrade { "Repository packages are up to date." } else { "Nothing to do: everything is up to date." };
+            ui::note(NoteKind::Success, done);
             return Ok(());
         }
         return apply_reasons(db, &reason_changes, Some(&was_explicit));
     }
 
     protect_held(db)?;
-    summarize(db, &reason_changes, &was_explicit);
-    ui::require("Commit this transaction, including package scripts and hooks? [y/N]")?;
+    // zap remove showed this exact set before asking for root; a second
+    // table in other columns would only repeat it.
+    let planned = request.operation == Operation::Remove
+        && !request.recursive
+        && trans.add.is_empty()
+        && trans.remove.len() == request.targets.len()
+        && trans.remove.iter().all(|p| request.targets.iter().any(|t| t.name == p.name));
+    if !planned {
+        summarize(db, request, &reason_changes, &was_explicit);
+    }
+    ui::require("Proceed with these changes? [Y/n]")?;
     signals::check()?;
     if let Err(e) = db.h.trans_commit() {
         db.explain(&e);
@@ -492,7 +519,7 @@ fn apply_reasons(db: &mut Alpm, targets: &[Target], was_explicit: Option<&HashSe
     ui::heading("Installation reasons", &ui::count(targets.len(), "change", "changes"));
     show_reasons(db, targets, was_explicit);
     ui::blank();
-    ui::require("Apply these installation reasons? [y/N]")?;
+    ui::require("Apply these installation reasons? [Y/n]")?;
     signals::check()?;
     for target in targets {
         let p = db.installed_pkg(&target.name).cloned();
@@ -550,8 +577,10 @@ impl Change {
     }
 }
 
-/// The final review: exactly what the transaction resolved, before anything changes.
-fn summarize(db: &Alpm, reason_changes: &[Target], was_explicit: &HashSet<String>) {
+/// The final review: exactly what the transaction resolved, before anything
+/// changes. Source and Reason match the plan, so what libalpm pulled in
+/// stands apart from what was asked for.
+fn summarize(db: &Alpm, request: &Request, reason_changes: &[Target], was_explicit: &HashSet<String>) {
     let mut counts = [0usize; 5];
     let (mut net, mut download) = (0i64, 0i64);
     let mut table = Table::new(&[
@@ -559,8 +588,19 @@ fn summarize(db: &Alpm, reason_changes: &[Target], was_explicit: &HashSet<String
         Column::new("Current"),
         Column::new("New").joiner(" → "),
         Column::new("Change"),
+        Column::new("Source"),
+        Column::new("Reason").tone(Tone::Muted),
         Column::new("Size").tone(Tone::Muted).right(),
     ]);
+    // Rows the request named, else why libalpm added them.
+    let reason = |name: &str, otherwise: &'static str| match request.targets.iter().find(|t| t.name == name) {
+        Some(t) if t.dependency => "dependency",
+        Some(_) => "requested",
+        None => otherwise,
+    };
+    let upgrade = request.operation == Operation::Upgrade;
+    // A removal the request did not name: unneeded under remove, else replaced.
+    let removed = if request.operation == Operation::Remove { "dependency" } else { "replaced" };
     let trans = db.h.trans();
     for add in &trans.add {
         let p = &add.pkg;
@@ -575,6 +615,8 @@ fn summarize(db: &Alpm, reason_changes: &[Target], was_explicit: &HashSet<String
             Cell::new(old.map_or("—", |o| o.version.as_str())),
             Cell::toned(p.version.as_str(), Tone::Success),
             Cell::toned(kind.name(), if kind == Change::Downgrade { Tone::Warning } else { Tone::Accent }),
+            Cell::new(match p.db_name() { "" => "built", name => name }),
+            Cell::new(reason(&p.name, if upgrade && old.is_some() { "update" } else { "dependency" })),
             Cell::new(ui::size_delta(delta)),
         ]);
     }
@@ -586,6 +628,8 @@ fn summarize(db: &Alpm, reason_changes: &[Target], was_explicit: &HashSet<String
             Cell::new(p.version.as_str()),
             Cell::toned("—", Tone::Muted),
             Cell::toned("remove", Tone::Danger),
+            Cell::new("local"),
+            Cell::new(reason(&p.name, removed)),
             Cell::new(ui::size_delta(-p.info().isize)),
         ]);
     }
@@ -657,8 +701,11 @@ fn copy_hash(path: &str, dest: Option<&str>, limit: u64, allow_empty: bool) -> R
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|_| unsafe_archive())?;
+        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { errors::with_hint(Kind::FileNotFound, "Check the path; install-files takes built package archives (*.pkg.tar.zst).", path) } else { unsafe_archive() })?;
     let meta = file.metadata().map_err(|_| unsafe_archive())?;
+    if meta.is_dir() {
+        return Err(errors::with_hint(Kind::UnsafeArchive, format!("{path} is a directory. zap install-local builds a directory with a PKGBUILD."), path));
+    }
     if !meta.is_file() || (!allow_empty && meta.len() == 0) || meta.len() > limit {
         return Err(unsafe_archive());
     }
@@ -757,7 +804,7 @@ mod tests {
     #[test]
     fn the_workers_exit_status_becomes_the_outcome_without_a_second_report() {
         outcome(0).unwrap();
-        for (status, kind) in [(130, Kind::WorkerCancelled), (1, Kind::WorkerFailed), (2, Kind::WorkerFailed), (137, Kind::WorkerInterrupted), (255, Kind::WorkerInterrupted)] {
+        for (status, kind) in [(130, Kind::WorkerCancelled), (3, Kind::WorkerDeclined), (1, Kind::WorkerFailed), (2, Kind::WorkerFailed), (137, Kind::WorkerInterrupted), (255, Kind::WorkerInterrupted)] {
             assert_eq!(kind, outcome(status).unwrap_err().kind(), "{status}");
         }
     }
